@@ -225,6 +225,7 @@
 
     <div class="card">
       <h2>Best spread over time — <span id="chart-asset"></span></h2>
+      <p class="hint" id="chart-hint" hidden>No server-side database here — history accumulates in your browser while this page is open.</p>
       <div class="legend">
         <span class="key"><span class="swatch" style="background:var(--series-net)"></span>Net of fees</span>
         <span class="key"><span class="swatch" style="background:var(--series-gross)"></span>Gross</span>
@@ -262,7 +263,28 @@ const fmtPx = (v) => v >= 1000 ? v.toLocaleString(undefined, {maximumFractionDig
                    : v.toLocaleString(undefined, {maximumFractionDigits: 5});
 const MARKET_NAMES = { crypto: "Crypto", fx: "Foreign exchange", metals: "Metals" };
 
-const state = { markets: {}, asset: null, market: "", minBps: null, hours: 6, statusData: null };
+const state = { markets: {}, asset: null, market: "", minBps: null, hours: 6,
+                statusData: null, timer: null };
+
+/* Client-side spread history for backends without a database (serverless). */
+const histStore = { lastTs: 0, data: {} };
+try {
+  const saved = JSON.parse(sessionStorage.getItem("arb-history") || "null");
+  if (saved && saved.data) Object.assign(histStore, saved);
+} catch (e) { /* private mode etc. */ }
+
+function recordHistory(st, best) {
+  if (st.history_available || !st.last_cycle || st.last_cycle === histStore.lastTs) return;
+  histStore.lastTs = st.last_cycle;
+  const cutoff = Date.now() / 1000 - 72 * 3600;
+  for (const [base, o] of Object.entries(best)) {
+    const arr = (histStore.data[base] ??= []);
+    arr.push({ts: o.ts, buy_exchange: o.buy_exchange, sell_exchange: o.sell_exchange,
+              gross_bps: o.gross_bps, net_bps: o.net_bps, executable: o.executable});
+    while (arr.length > 2000 || (arr.length && arr[0].ts < cutoff)) arr.shift();
+  }
+  try { sessionStorage.setItem("arb-history", JSON.stringify(histStore)); } catch (e) {}
+}
 
 async function getJSON(url) {
   const r = await fetch(url);
@@ -504,28 +526,39 @@ function renderChart() {
   });
 }
 
+async function updateChart(st) {
+  if (!state.asset) return;
+  if (st.history_available) {
+    const hist = await getJSON(`/api/history?asset=${state.asset}&hours=${state.hours}`);
+    chart.pts = hist.points;
+  } else {
+    const cutoff = Date.now() / 1000 - state.hours * 3600;
+    chart.pts = (histStore.data[state.asset] || []).filter((p) => p.ts >= cutoff);
+  }
+  $("chart-hint").hidden = !!st.history_available;
+  renderChart();
+}
+
 async function refresh() {
+  clearTimeout(state.timer);
   try {
-    const oppParams = new URLSearchParams();
-    if (state.minBps != null) oppParams.set("min_net_bps", state.minBps);
-    if (state.market) oppParams.set("market", state.market);
-    const q = oppParams.toString();
-    const [st, opps, quotes] = await Promise.all([
-      getJSON("/api/status"),
-      getJSON("/api/opportunities" + (q ? "?" + q : "")),
-      getJSON("/api/quotes"),
-    ]);
+    const data = await getJSON("/api/scan");
+    const st = data.status;
     state.statusData = st;
     renderStatus(st);
-    renderOpportunities(opps);
-    renderMatrices(quotes.quotes, st);
-    if (state.asset) {
-      const hist = await getJSON(`/api/history?asset=${state.asset}&hours=${state.hours}`);
-      chart.pts = hist.points;
-      renderChart();
-    }
+    let opps = data.opportunities;
+    if (state.market) opps = opps.filter((o) => o.market === state.market);
+    if (state.minBps != null) opps = opps.filter((o) => o.net_bps >= state.minBps);
+    renderOpportunities({ opportunities: opps, best_spreads: data.best_spreads });
+    renderMatrices(data.quotes, st);
+    recordHistory(st, data.best_spreads);
+    await updateChart(st);
   } catch (err) {
     $("updated").textContent = "connection lost — retrying…";
+  } finally {
+    const iv = Math.max(3, state.statusData?.poll_interval ?? 3) * 1000;
+    clearTimeout(state.timer);
+    state.timer = setTimeout(refresh, iv);
   }
 }
 
@@ -543,7 +576,6 @@ $("f-min").addEventListener("change", (e) => {
 window.addEventListener("resize", () => renderChart());
 
 refresh();
-setInterval(refresh, 3000);
 </script>
 </body>
 </html>

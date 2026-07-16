@@ -42,7 +42,22 @@ app = FastAPI(title="Market Arbitrage Tracker", lifespan=lifespan)
 
 @app.get("/api/status")
 def status():
-    return poller.snapshot()
+    st = poller.snapshot()
+    st["history_available"] = True
+    return st
+
+
+@app.get("/api/scan")
+def scan():
+    """Combined snapshot: one round-trip for the dashboard."""
+    st = poller.snapshot()
+    st["history_available"] = True
+    return {
+        "status": st,
+        "opportunities": [o.to_dict() for o in poller.opportunities],
+        "best_spreads": {b: o.to_dict() for b, o in poller.best.items()},
+        "quotes": [q.to_dict() for qs in poller.quotes.values() for q in qs],
+    }
 
 
 @app.get("/api/quotes")

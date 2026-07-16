@@ -52,6 +52,25 @@ python -m arb.cli
 python -m arb.cli --watch --market fx
 ```
 
+## Deploying to Vercel
+
+The repo is Vercel-ready: `api/index.py` exposes a serverless variant of the
+app (`arb/webapp.py`) and `vercel.json` routes everything to it. Deploy with
+`vercel deploy` (or connect the repo in the Vercel dashboard).
+
+Serverless differences vs self-hosting:
+
+- **No background poller** — each `/api/scan` request fetches venues live,
+  with a small in-instance gap (`ARB_MIN_SCAN_GAP`, default 3 s) so warm
+  instances don't hammer venue APIs, and a gentler dashboard refresh
+  cadence (`ARB_SCAN_INTERVAL`, default 15 s).
+- **No database** — spread history accumulates in the browser
+  (session-scoped) instead of SQLite; the opportunity log endpoint isn't
+  available.
+- The function region is pinned to `fra1` (Frankfurt) in `vercel.json`
+  because several exchanges geo-block US IPs, which is where default
+  regions land.
+
 ## Dashboard
 
 - **Stat tiles** — best executable net spread right now, opportunities above

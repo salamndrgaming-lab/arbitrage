@@ -167,6 +167,12 @@ def test_api_endpoints(tmp_path, monkeypatch):
         st = client.get("/api/status").json()
         assert st["markets"] == {"crypto": ["BTC"], "fx": ["EUR"]}
         assert {e["name"] for e in st["exchanges"]} == {"cheap", "rich", "ref"}
+        assert st["history_available"] is True
+
+        scan = client.get("/api/scan").json()
+        assert scan["status"]["history_available"] is True
+        assert scan["opportunities"] and scan["quotes"]
+        assert set(scan["best_spreads"]) == {"BTC", "EUR"}
 
         opps = client.get("/api/opportunities").json()
         assert opps["opportunities"]
