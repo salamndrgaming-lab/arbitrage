@@ -12,9 +12,13 @@ from pathlib import Path
 
 import yaml
 
-DEFAULT_ASSETS = ["BTC", "ETH", "SOL", "XRP", "LTC", "DOGE", "ADA"]
+DEFAULT_MARKETS: dict[str, list[str]] = {
+    "crypto": ["BTC", "ETH", "SOL", "XRP", "LTC", "DOGE", "ADA"],
+    "fx": ["EUR", "GBP", "AUD"],
+    "metals": ["XAU", "XAG"],
+}
 
-# name -> (region, default taker fee in bps)
+# name -> (region, default taker fee in bps). Reference-rate feeds have no fee.
 DEFAULT_EXCHANGES: dict[str, tuple[str, float]] = {
     "binance": ("Global", 10),
     "kraken": ("US", 26),
@@ -24,6 +28,10 @@ DEFAULT_EXCHANGES: dict[str, tuple[str, float]] = {
     "kucoin": ("Seychelles", 10),
     "okx": ("Asia", 10),
     "gateio": ("Asia", 20),
+    "frankfurter": ("ECB / EU", 0),
+    "openerapi": ("Global", 0),
+    "currencyapi": ("Global", 0),
+    "stooq": ("EU", 0),
 }
 
 DEFAULT_QUOTE_EQUIVALENCE = [["USD", "USDT", "USDC"]]
@@ -39,11 +47,12 @@ class ExchangeConfig:
 
 @dataclass
 class Config:
-    mode: str = "live"                  # "live" | "demo"
     poll_interval: float = 5.0
     min_net_bps: float = 10.0
     transfer_haircut_bps: float = 5.0
-    assets: list[str] = field(default_factory=lambda: list(DEFAULT_ASSETS))
+    markets: dict[str, list[str]] = field(
+        default_factory=lambda: {m: list(a) for m, a in DEFAULT_MARKETS.items()}
+    )
     quote_equivalence: list[list[str]] = field(
         default_factory=lambda: [list(g) for g in DEFAULT_QUOTE_EQUIVALENCE]
     )
@@ -62,6 +71,10 @@ class Config:
     def enabled_exchanges(self) -> dict[str, ExchangeConfig]:
         return {n: c for n, c in self.exchanges.items() if c.enabled}
 
+    @property
+    def all_assets(self) -> list[str]:
+        return [a for assets in self.markets.values() for a in assets]
+
     def fees_bps(self) -> dict[str, float]:
         return {n: c.taker_fee_bps for n, c in self.enabled_exchanges.items()}
 
@@ -76,8 +89,8 @@ class Config:
 def load_config(path: str | os.PathLike | None = None) -> Config:
     """Load config.yaml if present, otherwise return defaults.
 
-    Environment overrides: ``ARB_CONFIG`` (file path), ``ARB_MODE``
-    (live/demo), ``ARB_DB`` (database path).
+    Environment overrides: ``ARB_CONFIG`` (file path), ``ARB_DB``
+    (database path).
     """
     candidates = [path, os.environ.get("ARB_CONFIG"), "config.yaml"]
     raw: dict = {}
@@ -86,12 +99,18 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
             raw = yaml.safe_load(Path(cand).read_text()) or {}
             break
 
+    markets = {m: list(a) for m, a in DEFAULT_MARKETS.items()}
+    if "markets" in raw:
+        markets = {}
+        for market, opts in raw["markets"].items():
+            assets = opts.get("assets", []) if isinstance(opts, dict) else (opts or [])
+            markets[market.lower()] = [a.upper() for a in assets]
+
     cfg = Config(
-        mode=raw.get("mode", "live"),
         poll_interval=float(raw.get("poll_interval", 5)),
         min_net_bps=float(raw.get("min_net_bps", 10)),
         transfer_haircut_bps=float(raw.get("transfer_haircut_bps", 5)),
-        assets=[a.upper() for a in raw.get("assets", DEFAULT_ASSETS)],
+        markets=markets,
         quote_equivalence=[
             [q.upper() for q in group]
             for group in raw.get("quote_equivalence", DEFAULT_QUOTE_EQUIVALENCE)
@@ -114,8 +133,6 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
                 taker_fee_bps=float(opts.get("taker_fee_bps", default_fee)),
             )
 
-    if os.environ.get("ARB_MODE"):
-        cfg.mode = os.environ["ARB_MODE"].lower()
     if os.environ.get("ARB_DB"):
         cfg.db_path = os.environ["ARB_DB"]
     return cfg

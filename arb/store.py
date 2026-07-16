@@ -12,6 +12,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS opportunities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
+    market TEXT NOT NULL DEFAULT 'crypto',
     base TEXT NOT NULL,
     buy_exchange TEXT NOT NULL,
     buy_quote TEXT NOT NULL,
@@ -28,14 +29,23 @@ CREATE INDEX IF NOT EXISTS idx_opp_base_ts ON opportunities (base, ts);
 
 CREATE TABLE IF NOT EXISTS spreads (
     ts REAL NOT NULL,
+    market TEXT NOT NULL DEFAULT 'crypto',
     base TEXT NOT NULL,
     buy_exchange TEXT NOT NULL,
     sell_exchange TEXT NOT NULL,
     gross_bps REAL NOT NULL,
-    net_bps REAL NOT NULL
+    net_bps REAL NOT NULL,
+    executable INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_spread_base_ts ON spreads (base, ts);
 """
+
+# Columns added since the first release; applied to pre-existing databases.
+MIGRATIONS = [
+    "ALTER TABLE opportunities ADD COLUMN market TEXT NOT NULL DEFAULT 'crypto'",
+    "ALTER TABLE spreads ADD COLUMN market TEXT NOT NULL DEFAULT 'crypto'",
+    "ALTER TABLE spreads ADD COLUMN executable INTEGER NOT NULL DEFAULT 1",
+]
 
 
 class Store:
@@ -46,21 +56,26 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            for stmt in MIGRATIONS:
+                try:
+                    self._conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     def record_opportunities(self, opps: list[Opportunity]) -> None:
         if not opps:
             return
         rows = [
-            (o.ts, o.base, o.buy_exchange, o.buy_quote, o.buy_price,
+            (o.ts, o.market, o.base, o.buy_exchange, o.buy_quote, o.buy_price,
              o.sell_exchange, o.sell_quote, o.sell_price,
              o.gross_bps, o.net_bps, int(o.cross_quote))
             for o in opps
         ]
         with self._lock, self._conn:
             self._conn.executemany(
-                "INSERT INTO opportunities (ts, base, buy_exchange, buy_quote,"
-                " buy_price, sell_exchange, sell_quote, sell_price, gross_bps,"
-                " net_bps, cross_quote) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO opportunities (ts, market, base, buy_exchange,"
+                " buy_quote, buy_price, sell_exchange, sell_quote, sell_price,"
+                " gross_bps, net_bps, cross_quote) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
 
@@ -68,13 +83,15 @@ class Store:
         if not best:
             return
         rows = [
-            (o.ts, base, o.buy_exchange, o.sell_exchange, o.gross_bps, o.net_bps)
+            (o.ts, o.market, base, o.buy_exchange, o.sell_exchange,
+             o.gross_bps, o.net_bps, int(o.executable))
             for base, o in best.items()
         ]
         with self._lock, self._conn:
             self._conn.executemany(
-                "INSERT INTO spreads (ts, base, buy_exchange, sell_exchange,"
-                " gross_bps, net_bps) VALUES (?,?,?,?,?,?)",
+                "INSERT INTO spreads (ts, market, base, buy_exchange,"
+                " sell_exchange, gross_bps, net_bps, executable)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 rows,
             )
 
@@ -82,8 +99,8 @@ class Store:
         since = time.time() - hours * 3600
         with self._lock:
             rows = self._conn.execute(
-                "SELECT ts, buy_exchange, sell_exchange, gross_bps, net_bps"
-                " FROM spreads WHERE base = ? AND ts >= ?"
+                "SELECT ts, buy_exchange, sell_exchange, gross_bps, net_bps,"
+                " executable FROM spreads WHERE base = ? AND ts >= ?"
                 " ORDER BY ts DESC LIMIT ?",
                 (base, since, limit),
             ).fetchall()

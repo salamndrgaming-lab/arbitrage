@@ -8,14 +8,20 @@ from dataclasses import dataclass, field, asdict
 
 @dataclass(frozen=True)
 class Quote:
-    """Best bid/ask for one asset on one exchange."""
+    """Best bid/ask for one asset on one venue.
+
+    ``market`` groups instruments ("crypto", "fx", "metals"); quotes are only
+    ever compared within the same market. Reference feeds publish a single
+    rate — for those bid == ask.
+    """
 
     exchange: str
-    base: str          # e.g. "BTC"
+    base: str          # e.g. "BTC", "EUR", "XAU"
     quote: str         # actual quote currency on the venue, e.g. "USDT"
     bid: float
     ask: float
     ts: float = field(default_factory=time.time)
+    market: str = "crypto"
 
     @property
     def mid(self) -> float:
@@ -31,7 +37,8 @@ class Opportunity:
 
     Prices are per unit of the base asset. ``net_bps`` nets out both venues'
     taker fees and the configured transfer haircut; positive means the
-    round-trip is profitable on paper.
+    round-trip is profitable on paper. ``executable`` is True only when both
+    legs are tradable venues (not reference-rate feeds).
     """
 
     base: str
@@ -45,6 +52,8 @@ class Opportunity:
     net_bps: float
     cross_quote: bool      # True when buy/sell quote currencies differ
     ts: float = field(default_factory=time.time)
+    market: str = "crypto"
+    executable: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -52,7 +61,7 @@ class Opportunity:
 
 @dataclass
 class ExchangeStatus:
-    """Health of one exchange feed as seen by the poller."""
+    """Health of one venue feed as seen by the poller."""
 
     name: str
     region: str
@@ -61,6 +70,8 @@ class ExchangeStatus:
     latency_ms: float | None = None
     error: str | None = None
     quotes: int = 0
+    tradable: bool = True
+    markets: list[str] = field(default_factory=lambda: ["crypto"])
 
     def to_dict(self) -> dict:
         return asdict(self)

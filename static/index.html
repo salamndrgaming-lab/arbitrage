@@ -75,12 +75,6 @@
   header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
   h1 { font-size: 20px; font-weight: 650; margin: 0; }
   .sub { color: var(--text-secondary); font-size: 13px; margin: 0 0 16px; }
-  .badge {
-    font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
-    padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border);
-    color: var(--text-secondary);
-  }
-  .badge.demo { border-color: var(--series-net); color: var(--series-net); }
   #updated { margin-left: auto; color: var(--text-muted); font-size: 12px; }
 
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 12px 0 16px; }
@@ -110,6 +104,9 @@
     border-radius: 10px; padding: 14px 16px; min-width: 0;
   }
   .card h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+  .card h3 { font-size: 12px; font-weight: 600; margin: 14px 0 4px; color: var(--text-secondary);
+             letter-spacing: .03em; text-transform: uppercase; }
+  .card h3:first-of-type { margin-top: 4px; }
   .card .hint { font-size: 12px; color: var(--text-muted); margin: 0 0 10px; }
 
   .tblwrap { overflow-x: auto; }
@@ -123,6 +120,7 @@
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .ex { color: var(--text-secondary); }
+  .mkt { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
   .empty { color: var(--text-muted); padding: 18px 8px; font-size: 13px; }
 
   .legend { display: flex; gap: 16px; align-items: center; font-size: 12px; color: var(--text-secondary); margin: 2px 0 6px; }
@@ -153,6 +151,8 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; }
   .dot.ok { background: var(--good); }
   .dot.err { background: var(--critical); }
+  .reftag { font-size: 10px; letter-spacing: .04em; text-transform: uppercase;
+            border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; color: var(--text-muted); }
   .caveat { font-size: 12px; color: var(--text-muted); margin-top: 20px; }
 </style>
 </head>
@@ -160,10 +160,9 @@
 <div class="wrap">
   <header>
     <h1>Market Arbitrage Tracker</h1>
-    <span class="badge" id="mode">…</span>
     <span id="updated"></span>
   </header>
-  <p class="sub">Cross-exchange spreads on international crypto venues, net of taker fees and a transfer allowance.</p>
+  <p class="sub">Cross-venue spreads on international crypto, FX and metals markets, net of taker fees and a transfer allowance. Live data only.</p>
 
   <div class="tiles">
     <div class="tile">
@@ -177,18 +176,21 @@
       <div class="note" id="tile-count-note"></div>
     </div>
     <div class="tile">
-      <div class="label">Exchanges online</div>
+      <div class="label">Venues online</div>
       <div class="value" id="tile-ex">—</div>
       <div class="note" id="tile-ex-note"></div>
     </div>
     <div class="tile">
       <div class="label">Assets tracked</div>
       <div class="value" id="tile-assets">—</div>
-      <div class="note">vs USD / USDT</div>
+      <div class="note" id="tile-assets-note"></div>
     </div>
   </div>
 
   <div class="filters">
+    <label>Market
+      <select id="f-market"><option value="">All markets</option></select>
+    </label>
     <label>Asset
       <select id="f-asset"></select>
     </label>
@@ -208,7 +210,7 @@
   <div class="grid">
     <div class="card">
       <h2>Live opportunities</h2>
-      <p class="hint">Buy at the ask, sell at the bid; net spread deducts both taker fees + transfer allowance.</p>
+      <p class="hint">Buy at the ask, sell at the bid, both legs on tradable venues; net spread deducts both taker fees + transfer allowance.</p>
       <div class="tblwrap">
         <table id="opps">
           <thead><tr>
@@ -227,7 +229,7 @@
         <span class="key"><span class="swatch" style="background:var(--series-net)"></span>Net of fees</span>
         <span class="key"><span class="swatch" style="background:var(--series-gross)"></span>Gross</span>
       </div>
-      <svg id="chart" height="240" role="img" aria-label="Best cross-exchange spread over time in basis points"></svg>
+      <svg id="chart" height="240" role="img" aria-label="Best cross-venue spread over time in basis points"></svg>
       <div class="tooltip" id="chart-tip"></div>
     </div>
   </div>
@@ -235,20 +237,20 @@
   <div class="card" style="margin-top:12px">
     <h2>Price matrix</h2>
     <p class="hint">
-      Mid price per venue.
+      Mid price per venue; reference feeds marked <span class="reftag">ref</span> publish a single rate and are never counted as an arbitrage leg.
       <span class="keydot" style="background:var(--wash-buy);border:1px solid var(--series-net)"></span>lowest ask (cheapest to buy)
       &nbsp;<span class="keydot" style="background:var(--wash-sell);border:1px solid var(--series-gross)"></span>highest bid (best to sell)
     </p>
-    <div class="tblwrap"><table class="matrix" id="matrix"><thead></thead><tbody></tbody></table></div>
+    <div id="matrices"></div>
   </div>
 
   <div class="card" style="margin-top:12px">
-    <h2>Exchange feeds</h2>
-    <p class="hint">Public REST tickers; a failing venue is skipped, not fatal.</p>
+    <h2>Venue feeds</h2>
+    <p class="hint">Public keyless REST endpoints; a failing venue is skipped, not fatal. Some exchanges geo-block by IP — those show as degraded.</p>
     <div class="status-list" id="statuses"></div>
   </div>
 
-  <p class="caveat">Paper spreads only: real execution adds slippage, transfer time and withdrawal fees that vary by asset and network. USD↔USDT legs carry stablecoin basis risk. This tool observes and records — it does not trade.</p>
+  <p class="caveat">Paper spreads only: real execution adds slippage, transfer time and withdrawal fees that vary by asset and network. USD↔USDT legs carry stablecoin basis risk; XAU on crypto venues trades as PAXG (tokenized gold), which carries its own premium. This tool observes and records — it does not trade.</p>
 </div>
 
 <script>
@@ -258,8 +260,9 @@ const fmtBps = (v) => (v >= 0 ? "+" : "") + v.toFixed(1) + " bps";
 const fmtPx = (v) => v >= 1000 ? v.toLocaleString(undefined, {maximumFractionDigits: 0})
                    : v >= 10   ? v.toLocaleString(undefined, {maximumFractionDigits: 2})
                    : v.toLocaleString(undefined, {maximumFractionDigits: 5});
+const MARKET_NAMES = { crypto: "Crypto", fx: "Foreign exchange", metals: "Metals" };
 
-const state = { assets: [], asset: null, minBps: null, hours: 6, history: [], statusData: null };
+const state = { markets: {}, asset: null, market: "", minBps: null, hours: 6, statusData: null };
 
 async function getJSON(url) {
   const r = await fetch(url);
@@ -267,10 +270,27 @@ async function getJSON(url) {
   return r.json();
 }
 
+function populateAssetSelect() {
+  const sel = $("f-asset");
+  const prev = state.asset;
+  sel.innerHTML = "";
+  for (const [market, assets] of Object.entries(state.markets)) {
+    if (state.market && market !== state.market) continue;
+    const og = document.createElement("optgroup");
+    og.label = MARKET_NAMES[market] || market;
+    for (const a of assets) {
+      const opt = document.createElement("option");
+      opt.value = a; opt.textContent = a;
+      og.appendChild(opt);
+    }
+    sel.appendChild(og);
+  }
+  const options = [...sel.querySelectorAll("option")].map((o) => o.value);
+  state.asset = options.includes(prev) ? prev : options[0] || null;
+  if (state.asset) sel.value = state.asset;
+}
+
 function renderStatus(st) {
-  const modeEl = $("mode");
-  modeEl.textContent = st.mode === "demo" ? "demo data" : "live";
-  modeEl.classList.toggle("demo", st.mode === "demo");
   $("updated").textContent = st.last_cycle
     ? "updated " + new Date(st.last_cycle * 1000).toLocaleTimeString() : "waiting for first cycle…";
 
@@ -278,24 +298,31 @@ function renderStatus(st) {
   $("tile-ex").textContent = up + " / " + st.exchanges.length;
   $("tile-ex-note").textContent = st.exchanges.map((e) => e.region)
     .filter((v, i, a) => a.indexOf(v) === i).join(" · ");
-  $("tile-assets").textContent = st.assets.length;
+  const allAssets = Object.values(st.markets).flat();
+  $("tile-assets").textContent = allAssets.length;
+  $("tile-assets-note").textContent = Object.keys(st.markets)
+    .map((m) => MARKET_NAMES[m] || m).join(" · ");
   $("tile-count-note").textContent = "threshold " +
     (state.minBps ?? st.min_net_bps) + " bps net";
 
-  if (!state.assets.length) {
-    state.assets = st.assets;
-    state.asset = st.assets[0];
-    const sel = $("f-asset");
-    sel.innerHTML = st.assets.map((a) => `<option>${a}</option>`).join("");
-    sel.value = state.asset;
+  if (!Object.keys(state.markets).length) {
+    state.markets = st.markets;
+    const msel = $("f-market");
+    for (const m of Object.keys(st.markets)) {
+      const opt = document.createElement("option");
+      opt.value = m; opt.textContent = MARKET_NAMES[m] || m;
+      msel.appendChild(opt);
+    }
+    populateAssetSelect();
   }
 
   $("statuses").innerHTML = st.exchanges.map((e) => {
     const detail = e.ok
-      ? `${e.quotes} pairs · ${e.latency_ms} ms`
-      : (e.error || "no data").slice(0, 60);
+      ? `${e.quotes} instruments · ${e.latency_ms} ms`
+      : (e.error || "no data").slice(0, 70);
+    const ref = e.tradable ? "" : ' <span class="reftag">ref</span>';
     return `<span class="status-pill"><span class="dot ${e.ok ? "ok" : "err"}"></span>` +
-           `<strong>${e.name}</strong> <span>${e.region}</span> · ${detail}</span>`;
+           `<strong>${e.name}</strong>${ref} <span>${e.region}</span> · ${detail}</span>`;
   }).join("");
 }
 
@@ -305,7 +332,7 @@ function renderOpportunities(data) {
   $("opps-empty").hidden = opps.length > 0;
   tbody.innerHTML = opps.slice(0, 12).map((o) => `
     <tr>
-      <td><strong>${o.base}</strong>${o.cross_quote ? ' <span class="ex" title="buy/sell legs use different quote currencies">†</span>' : ""}</td>
+      <td><strong>${o.base}</strong> <span class="mkt">${o.market}</span>${o.cross_quote ? ' <span class="ex" title="buy/sell legs use different quote currencies">†</span>' : ""}</td>
       <td><span class="ex">${o.buy_exchange}</span> ${fmtPx(o.buy_price)} <span class="ex">${o.buy_quote}</span></td>
       <td><span class="ex">${o.sell_exchange}</span> ${fmtPx(o.sell_price)} <span class="ex">${o.sell_quote}</span></td>
       <td class="num">${fmtBps(o.gross_bps)}</td>
@@ -315,46 +342,72 @@ function renderOpportunities(data) {
 
   $("tile-count").textContent = opps.length;
 
-  const best = Object.values(data.best_spreads).sort((a, b) => b.net_bps - a.net_bps)[0];
+  let best = Object.values(data.best_spreads);
+  if (state.market) best = best.filter((o) => o.market === state.market);
+  best = best.filter((o) => o.executable).sort((a, b) => b.net_bps - a.net_bps)[0];
+  const el = $("tile-best");
   if (best) {
-    const el = $("tile-best");
     el.textContent = fmtBps(best.net_bps);
     el.className = "value hero " + (best.net_bps >= 0 ? "pos" : "neg");
     $("tile-best-note").textContent =
       `${best.base}: buy ${best.buy_exchange} → sell ${best.sell_exchange}`;
+  } else {
+    el.textContent = "—";
+    el.className = "value hero";
+    $("tile-best-note").textContent = "no tradable pairs yet";
   }
 }
 
-function renderMatrix(quotes, statusData) {
-  if (!statusData) return;
-  const exs = statusData.exchanges.map((e) => e.name);
-  const byAsset = {};
-  for (const q of quotes) (byAsset[q.base] ??= {})[q.exchange] = q;
+function renderMatrices(quotes, st) {
+  if (!st) return;
+  const container = $("matrices");
+  container.innerHTML = "";
+  for (const [market, assets] of Object.entries(state.markets)) {
+    if (state.market && market !== state.market) continue;
+    const mq = quotes.filter((q) => q.market === market);
+    const venues = st.exchanges
+      .filter((e) => e.markets.includes(market))
+      .map((e) => e.name)
+      .filter((v) => mq.some((q) => q.exchange === v) ||
+                     st.exchanges.find((e) => e.name === v).ok);
+    if (!venues.length) continue;
+    const refset = new Set(st.exchanges.filter((e) => !e.tradable).map((e) => e.name));
+    const byAsset = {};
+    for (const q of mq) (byAsset[q.base] ??= {})[q.exchange] = q;
 
-  $("matrix").querySelector("thead").innerHTML =
-    "<tr><th>Asset</th>" + exs.map((e) => `<th class="num">${e}</th>`).join("") + "</tr>";
+    const head = "<tr><th>Asset</th>" + venues.map((v) =>
+      `<th class="num">${v}${refset.has(v) ? ' <span class="reftag">ref</span>' : ""}</th>`).join("") + "</tr>";
 
-  $("matrix").querySelector("tbody").innerHTML = state.assets.map((a) => {
-    const row = byAsset[a] || {};
-    let bestBid = null, bestAsk = null;
-    for (const e of exs) {
-      const q = row[e];
-      if (!q) continue;
-      if (!bestBid || q.bid > row[bestBid].bid) bestBid = e;
-      if (!bestAsk || q.ask < row[bestAsk].ask) bestAsk = e;
-    }
-    const cells = exs.map((e) => {
-      const q = row[e];
-      if (!q) return '<td class="num ex">—</td>';
-      const cls = e === bestAsk ? "buy" : e === bestBid ? "sell" : "";
-      return `<td class="num ${cls}" title="bid ${fmtPx(q.bid)} / ask ${fmtPx(q.ask)} ${q.quote}">${fmtPx((q.bid + q.ask) / 2)}</td>`;
+    const body = assets.map((a) => {
+      const row = byAsset[a] || {};
+      let bestBid = null, bestAsk = null;
+      for (const v of venues) {
+        const q = row[v];
+        if (!q || refset.has(v)) continue;  // highlights are for tradable venues
+        if (!bestBid || q.bid > row[bestBid].bid) bestBid = v;
+        if (!bestAsk || q.ask < row[bestAsk].ask) bestAsk = v;
+      }
+      const cells = venues.map((v) => {
+        const q = row[v];
+        if (!q) return '<td class="num ex">—</td>';
+        const cls = v === bestAsk ? "buy" : v === bestBid ? "sell" : "";
+        return `<td class="num ${cls}" title="bid ${fmtPx(q.bid)} / ask ${fmtPx(q.ask)} ${q.quote}">${fmtPx((q.bid + q.ask) / 2)}</td>`;
+      }).join("");
+      return `<tr><td><strong>${a}</strong></td>${cells}</tr>`;
     }).join("");
-    return `<tr><td><strong>${a}</strong></td>${cells}</tr>`;
-  }).join("");
+
+    const section = document.createElement("div");
+    section.innerHTML = `<h3>${MARKET_NAMES[market] || market}</h3>
+      <div class="tblwrap"><table class="matrix"><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+    container.appendChild(section);
+  }
+  if (!container.children.length) {
+    container.innerHTML = '<div class="empty">Waiting for the first quotes…</div>';
+  }
 }
 
 /* ---- spread history chart: 2px lines, hairline grid, crosshair + tooltip ---- */
-const chart = { pts: [], geom: null };
+const chart = { pts: [] };
 
 function niceTicks(min, max, n = 4) {
   const span = max - min || 1;
@@ -376,7 +429,6 @@ function renderChart() {
   if (pts.length < 2) {
     svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle"
       fill="var(--text-muted)" font-size="13">collecting history…</text>`;
-    chart.geom = null;
     return;
   }
   const pad = { l: 44, r: 12, t: 8, b: 22 };
@@ -387,7 +439,6 @@ function renderChart() {
   const ypad = (y1 - y0) * 0.08 || 1; y0 -= ypad; y1 += ypad;
   const X = (t) => pad.l + ((t - x0) / (x1 - x0 || 1)) * (W - pad.l - pad.r);
   const Y = (v) => pad.t + (1 - (v - y0) / (y1 - y0)) * (H - pad.t - pad.b);
-  chart.geom = { X, Y, x0, x1, pad, W, H };
 
   const ticks = niceTicks(y0, y1);
   const grid = ticks.map((v) =>
@@ -438,8 +489,9 @@ function renderChart() {
     xhair.setAttribute("x1", X(p.ts)); xhair.setAttribute("x2", X(p.ts));
     xhair.setAttribute("visibility", "visible");
     tip.style.display = "block";
+    const ref = p.executable ? "" : " · reference leg";
     tip.innerHTML = `<div class="t">${new Date(p.ts * 1000).toLocaleTimeString()}
-        · ${p.buy_exchange} → ${p.sell_exchange}</div>
+        · ${p.buy_exchange} → ${p.sell_exchange}${ref}</div>
       <div class="row"><span class="swatch" style="background:var(--series-net)"></span>Net<span class="v">${fmtBps(p.net_bps)}</span></div>
       <div class="row"><span class="swatch" style="background:var(--series-gross)"></span>Gross<span class="v">${fmtBps(p.gross_bps)}</span></div>`;
     const tw = tip.offsetWidth;
@@ -454,15 +506,19 @@ function renderChart() {
 
 async function refresh() {
   try {
+    const oppParams = new URLSearchParams();
+    if (state.minBps != null) oppParams.set("min_net_bps", state.minBps);
+    if (state.market) oppParams.set("market", state.market);
+    const q = oppParams.toString();
     const [st, opps, quotes] = await Promise.all([
       getJSON("/api/status"),
-      getJSON("/api/opportunities" + (state.minBps != null ? "?min_net_bps=" + state.minBps : "")),
+      getJSON("/api/opportunities" + (q ? "?" + q : "")),
       getJSON("/api/quotes"),
     ]);
     state.statusData = st;
     renderStatus(st);
     renderOpportunities(opps);
-    renderMatrix(quotes.quotes, st);
+    renderMatrices(quotes.quotes, st);
     if (state.asset) {
       const hist = await getJSON(`/api/history?asset=${state.asset}&hours=${state.hours}`);
       chart.pts = hist.points;
@@ -473,6 +529,11 @@ async function refresh() {
   }
 }
 
+$("f-market").addEventListener("change", (e) => {
+  state.market = e.target.value;
+  populateAssetSelect();
+  refresh();
+});
 $("f-asset").addEventListener("change", (e) => { state.asset = e.target.value; refresh(); });
 $("f-hours").addEventListener("change", (e) => { state.hours = +e.target.value; refresh(); });
 $("f-min").addEventListener("change", (e) => {

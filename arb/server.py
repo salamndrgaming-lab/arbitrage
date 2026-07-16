@@ -1,7 +1,6 @@
 """FastAPI app: JSON API plus the static dashboard.
 
 Run with:  uvicorn arb.server:app  (or `python -m arb.server`)
-Demo mode: ARB_MODE=demo uvicorn arb.server:app
 """
 
 from __future__ import annotations
@@ -47,20 +46,28 @@ def status():
 
 
 @app.get("/api/quotes")
-def quotes(asset: str | None = None):
+def quotes(asset: str | None = None, market: str | None = None):
     out = [q.to_dict() for qs in poller.quotes.values() for q in qs]
     if asset:
         out = [q for q in out if q["base"] == asset.upper()]
+    if market:
+        out = [q for q in out if q["market"] == market.lower()]
     return {"quotes": out}
 
 
 @app.get("/api/opportunities")
-def opportunities(min_net_bps: float | None = None, asset: str | None = None):
+def opportunities(
+    min_net_bps: float | None = None,
+    asset: str | None = None,
+    market: str | None = None,
+):
     opps = poller.opportunities
     if min_net_bps is not None:
         opps = [o for o in opps if o.net_bps >= min_net_bps]
     if asset:
         opps = [o for o in opps if o.base == asset.upper()]
+    if market:
+        opps = [o for o in opps if o.market == market.lower()]
     return {
         "opportunities": [o.to_dict() for o in opps],
         "best_spreads": {b: o.to_dict() for b, o in poller.best.items()},
@@ -73,8 +80,8 @@ def history(
     hours: float = Query(6.0, gt=0, le=168),
 ):
     asset = asset.upper()
-    if asset not in cfg.assets:
-        raise HTTPException(404, f"unknown asset {asset!r}; tracked: {cfg.assets}")
+    if asset not in cfg.all_assets:
+        raise HTTPException(404, f"unknown asset {asset!r}; tracked: {cfg.all_assets}")
     return {"asset": asset, "points": store.spread_history(asset, hours)}
 
 

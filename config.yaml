@@ -1,30 +1,38 @@
 # Market arbitrage tracker configuration.
 # Every value here has a built-in default; delete a line to fall back to it.
 
-mode: live            # live = poll real exchange APIs | demo = simulated feed
 poll_interval: 5      # seconds between polling cycles
 min_net_bps: 10       # opportunities must clear this net spread (basis points) to be reported
 transfer_haircut_bps: 5   # flat allowance per round-trip for withdrawal/transfer costs
 
-# Assets tracked on every enabled exchange (quoted in USD / USDT / USDC).
-assets: [BTC, ETH, SOL, XRP, LTC, DOGE, ADA]
+# Markets and the assets tracked in each (quoted in USD / USDT / USDC).
+markets:
+  crypto: { assets: [BTC, ETH, SOL, XRP, LTC, DOGE, ADA] }
+  fx:     { assets: [EUR, GBP, AUD] }     # vs USD
+  metals: { assets: [XAU, XAG] }          # gold, silver (XAU trades as PAXG on crypto venues)
 
 # Quote currencies treated as interchangeable when comparing prices across
-# exchanges. Opportunities that cross quote currencies are flagged in the UI.
+# venues. Opportunities that cross quote currencies are flagged in the UI.
 quote_equivalence:
   - [USD, USDT, USDC]
 
 # taker_fee_bps: taker fee in basis points used to net out costs.
-# Adjust to your own fee tier on each venue.
+# Adjust to your own fee tier on each venue. Reference-rate feeds
+# (frankfurter, openerapi, currencyapi, stooq) are not tradable: they are
+# used for price tracking/divergence only and never form opportunities.
 exchanges:
-  binance:  { enabled: true, taker_fee_bps: 10 }   # Global
-  kraken:   { enabled: true, taker_fee_bps: 26 }   # US
-  coinbase: { enabled: true, taker_fee_bps: 60 }   # US
-  bitstamp: { enabled: true, taker_fee_bps: 40 }   # EU (Luxembourg)
-  bitfinex: { enabled: true, taker_fee_bps: 20 }   # BVI
-  kucoin:   { enabled: true, taker_fee_bps: 10 }   # Seychelles
-  okx:      { enabled: true, taker_fee_bps: 10 }   # Asia / Seychelles
-  gateio:   { enabled: true, taker_fee_bps: 20 }   # Asia
+  binance:     { enabled: true, taker_fee_bps: 10 }   # Global — crypto, fx, PAXG
+  kraken:      { enabled: true, taker_fee_bps: 26 }   # US — crypto + fiat FX pairs
+  coinbase:    { enabled: true, taker_fee_bps: 60 }   # US — crypto
+  bitstamp:    { enabled: true, taker_fee_bps: 40 }   # EU — crypto + fiat FX pairs
+  bitfinex:    { enabled: true, taker_fee_bps: 20 }   # BVI — crypto
+  kucoin:      { enabled: true, taker_fee_bps: 10 }   # Seychelles — crypto, PAXG
+  okx:         { enabled: true, taker_fee_bps: 10 }   # Asia — crypto
+  gateio:      { enabled: true, taker_fee_bps: 20 }   # Asia — crypto, PAXG
+  frankfurter: { enabled: true, taker_fee_bps: 0 }    # ECB reference rates (fx)
+  openerapi:   { enabled: true, taker_fee_bps: 0 }    # open.er-api.com (fx)
+  currencyapi: { enabled: true, taker_fee_bps: 0 }    # currency-api (fx + metals)
+  stooq:       { enabled: true, taker_fee_bps: 0 }    # stooq.com delayed (fx + metals)
 
 db_path: arb.sqlite3
 history_retention_hours: 72

@@ -9,8 +9,9 @@ CFG = Config()
 GROUP = CFG.quote_group
 
 
-def q(exchange, base, quote, bid, ask):
-    return Quote(exchange=exchange, base=base, quote=quote, bid=bid, ask=ask, ts=1.0)
+def q(exchange, base, quote, bid, ask, market="crypto"):
+    return Quote(exchange=exchange, base=base, quote=quote,
+                 bid=bid, ask=ask, ts=1.0, market=market)
 
 
 def test_net_spread_math():
@@ -50,6 +51,32 @@ def test_find_opportunities_filters_and_sorts():
     assert opps[0].net_bps >= opps[1].net_bps
     assert opps[0].buy_exchange == "a" and opps[0].sell_exchange == "b"
     assert all(o.net_bps >= 10 for o in opps)
+
+
+def test_reference_feeds_never_form_opportunities():
+    quotes = [
+        q("kraken", "EUR", "USD", 1.0800, 1.0801, market="fx"),
+        q("ecbref", "EUR", "USD", 1.0950, 1.0950, market="fx"),   # divergent reference
+        q("bitstamp", "EUR", "USD", 1.0900, 1.0901, market="fx"),
+    ]
+    tradable = {"kraken", "bitstamp"}
+    opps = find_opportunities(quotes, {}, 10, 0, GROUP, tradable)
+    legs = {(o.buy_exchange, o.sell_exchange) for o in opps}
+    assert legs == {("kraken", "bitstamp")}  # ~92 bps, real venues only
+
+    # but the reference feed still shows up in best-spread tracking
+    best = best_spreads(quotes, {}, 0, GROUP, tradable)
+    assert best["EUR"].sell_exchange == "ecbref"
+    assert best["EUR"].executable is False
+
+
+def test_markets_never_cross():
+    # Same base symbol in two different markets must not pair.
+    quotes = [
+        q("a", "XAU", "USD", 2000, 2001, market="metals"),
+        q("b", "XAU", "USD", 2100, 2101, market="crypto"),
+    ]
+    assert find_opportunities(quotes, {}, 0, 0, GROUP) == []
 
 
 def test_quote_groups_separate_non_equivalent_quotes():
