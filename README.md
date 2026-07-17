@@ -126,6 +126,40 @@ overrides: `ARB_DB=path.sqlite3`, `ARB_CONFIG=path.yaml`.
 History and the opportunity log persist in SQLite (`arb.sqlite3`), pruned to
 `history_retention_hours`.
 
+## Live autonomous trading (opt-in, guarded)
+
+The `arb/trading/` package can execute detected opportunities for real —
+dual-leg immediate-or-cancel limit orders on Binance and Kraken, using
+pre-positioned balances on both venues. See [ARCHITECTURE.md](ARCHITECTURE.md)
+for the full design and guardrail table.
+
+**It is disarmed by default.** Arming requires *all three*:
+
+1. `trading.enabled: true` in `config.yaml`
+2. `ARB_TRADING_ARMED=I-ACCEPT-THE-RISK` in the environment
+3. Venue credentials: `ARB_BINANCE_API_KEY`/`ARB_BINANCE_API_SECRET`,
+   `ARB_KRAKEN_API_KEY`/`ARB_KRAKEN_API_SECRET`
+
+```bash
+python -m arb.trade check    # verify arming + credentials, print limits
+python -m arb.trade run      # start the autonomous loop
+python -m arb.trade status   # audit trail + daily stats
+touch TRADING_KILL_SWITCH    # halt trading immediately, no deploy needed
+```
+
+Every trade passes a risk gate first: per-trade/daily notional caps, daily
+loss limit, trade-count cap, per-asset cooldown, stale-quote rejection,
+venue/asset allowlists, balance pre-checks on both legs, and a circuit
+breaker that disarms after consecutive failures. Every attempt — filled,
+partial, or failed — lands in the `trades` audit table (visible at
+`/api/trades` on the self-hosted server). Trading never runs on the Vercel
+deployment; it is a separate self-hosted process.
+
+Start with the default caps ($100/trade, $1,000/day) and exchange
+sub-accounts holding only what you are prepared to lose. Cross-exchange
+crypto arbitrage spreads are usually thinner than fees + slippage; expect
+the risk gate to reject almost everything — that is it working.
+
 ## Tests
 
 ```bash

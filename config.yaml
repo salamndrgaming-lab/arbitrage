@@ -36,3 +36,25 @@ exchanges:
 
 db_path: arb.sqlite3
 history_retention_hours: 72
+
+# ---------------------------------------------------------------------------
+# LIVE AUTONOMOUS TRADING — places REAL orders with REAL funds when armed.
+# enabled: true alone does nothing; the trader also requires the environment
+# variable ARB_TRADING_ARMED=I-ACCEPT-THE-RISK plus API credentials
+# (ARB_BINANCE_API_KEY/ARB_BINANCE_API_SECRET, ARB_KRAKEN_API_KEY/...).
+# Stop it at any time: create the kill-switch file or set ARB_KILL_SWITCH=1.
+# ---------------------------------------------------------------------------
+trading:
+  enabled: false
+  venues: [binance, kraken]     # venues with execution support + credentials
+  assets: [BTC, ETH]            # assets the trader may touch
+  markets: [crypto]
+  min_execute_bps: 30           # execute only if net spread clears this
+  max_trade_notional_usd: 100   # hard cap per trade
+  max_daily_notional_usd: 1000  # hard cap per rolling 24h
+  max_trades_per_day: 20
+  max_daily_loss_usd: 50        # stop trading for the day past this
+  cooldown_seconds: 60          # min gap between trades in the same asset
+  max_quote_age_seconds: 3      # never trade on stale quotes
+  max_consecutive_failures: 3   # circuit breaker: then disarm until restart
+  kill_switch_file: TRADING_KILL_SWITCH

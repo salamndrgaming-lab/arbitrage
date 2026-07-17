@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -103,6 +104,15 @@ def history(
 @app.get("/api/opportunities/recent")
 def recent(hours: float = Query(24.0, gt=0, le=168), limit: int = Query(200, le=1000)):
     return {"opportunities": store.recent_opportunities(hours, limit)}
+
+
+@app.get("/api/trades")
+def trades(hours: float = Query(24.0, gt=0, le=720), limit: int = Query(200, le=1000)):
+    """Audit trail written by the (separately run) trader process."""
+    return {
+        "trades": store.recent_trades(hours, limit),
+        "stats_24h": store.trade_stats_since(time.time() - 24 * 3600),
+    }
 
 
 @app.get("/")

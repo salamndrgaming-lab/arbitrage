@@ -46,6 +46,30 @@ class ExchangeConfig:
 
 
 @dataclass
+class TradingConfig:
+    """Guardrails for live execution. Defaults are deliberately tiny.
+
+    ``enabled`` alone does NOT arm trading — the environment variable
+    ``ARB_TRADING_ARMED=I-ACCEPT-THE-RISK`` and venue API credentials are
+    also required (see arb/trading/trader.py::arm_check).
+    """
+
+    enabled: bool = False
+    venues: list[str] = field(default_factory=lambda: ["binance", "kraken"])
+    assets: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
+    markets: list[str] = field(default_factory=lambda: ["crypto"])
+    min_execute_bps: float = 30.0          # execute only well above display threshold
+    max_trade_notional_usd: float = 100.0
+    max_daily_notional_usd: float = 1000.0
+    max_trades_per_day: int = 20
+    max_daily_loss_usd: float = 50.0
+    cooldown_seconds: float = 60.0
+    max_quote_age_seconds: float = 3.0
+    max_consecutive_failures: int = 3
+    kill_switch_file: str = "TRADING_KILL_SWITCH"
+
+
+@dataclass
 class Config:
     poll_interval: float = 5.0
     min_net_bps: float = 10.0
@@ -57,6 +81,7 @@ class Config:
         default_factory=lambda: [list(g) for g in DEFAULT_QUOTE_EQUIVALENCE]
     )
     exchanges: dict[str, ExchangeConfig] = field(default_factory=dict)
+    trading: TradingConfig = field(default_factory=TradingConfig)
     db_path: str = "arb.sqlite3"
     history_retention_hours: float = 72.0
 
@@ -132,6 +157,31 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
                 enabled=bool(opts.get("enabled", True)),
                 taker_fee_bps=float(opts.get("taker_fee_bps", default_fee)),
             )
+
+    raw_trading = raw.get("trading")
+    if raw_trading:
+        t = TradingConfig()
+        cfg.trading = TradingConfig(
+            enabled=bool(raw_trading.get("enabled", False)),
+            venues=[v.lower() for v in raw_trading.get("venues", t.venues)],
+            assets=[a.upper() for a in raw_trading.get("assets", t.assets)],
+            markets=[m.lower() for m in raw_trading.get("markets", t.markets)],
+            min_execute_bps=float(raw_trading.get("min_execute_bps", t.min_execute_bps)),
+            max_trade_notional_usd=float(
+                raw_trading.get("max_trade_notional_usd", t.max_trade_notional_usd)),
+            max_daily_notional_usd=float(
+                raw_trading.get("max_daily_notional_usd", t.max_daily_notional_usd)),
+            max_trades_per_day=int(
+                raw_trading.get("max_trades_per_day", t.max_trades_per_day)),
+            max_daily_loss_usd=float(
+                raw_trading.get("max_daily_loss_usd", t.max_daily_loss_usd)),
+            cooldown_seconds=float(raw_trading.get("cooldown_seconds", t.cooldown_seconds)),
+            max_quote_age_seconds=float(
+                raw_trading.get("max_quote_age_seconds", t.max_quote_age_seconds)),
+            max_consecutive_failures=int(
+                raw_trading.get("max_consecutive_failures", t.max_consecutive_failures)),
+            kill_switch_file=raw_trading.get("kill_switch_file", t.kill_switch_file),
+        )
 
     if os.environ.get("ARB_DB"):
         cfg.db_path = os.environ["ARB_DB"]

@@ -38,6 +38,23 @@ CREATE TABLE IF NOT EXISTS spreads (
     executable INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_spread_base_ts ON spreads (base, ts);
+
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    market TEXT NOT NULL,
+    base TEXT NOT NULL,
+    buy_exchange TEXT NOT NULL,
+    sell_exchange TEXT NOT NULL,
+    buy_price REAL NOT NULL,
+    sell_price REAL NOT NULL,
+    qty REAL NOT NULL,
+    notional_usd REAL NOT NULL,
+    expected_net_bps REAL NOT NULL,
+    status TEXT NOT NULL,          -- filled | partial | failed
+    detail TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (ts);
 """
 
 # Columns added since the first release; applied to pre-existing databases.
@@ -115,6 +132,46 @@ class Store:
                 (since, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- trading audit trail ----------------------------------------------
+
+    def record_trade(self, opp: Opportunity, qty: float, notional_usd: float,
+                     status: str, detail: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO trades (ts, market, base, buy_exchange, sell_exchange,"
+                " buy_price, sell_price, qty, notional_usd, expected_net_bps,"
+                " status, detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), opp.market, opp.base, opp.buy_exchange,
+                 opp.sell_exchange, opp.buy_price, opp.sell_price, qty,
+                 notional_usd, opp.net_bps, status, detail),
+            )
+
+    def recent_trades(self, hours: float = 24.0, limit: int = 200) -> list[dict]:
+        since = time.time() - hours * 3600
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM trades WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+                (since, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def trade_stats_since(self, since_ts: float) -> dict:
+        """Aggregates for risk limits. Realized PnL is conservative:
+        filled trades earn their expected net; partial and failed trades are
+        booked at zero gain minus the notional's expected edge (worst case
+        unknown, so they only ever count against the loss limit via 0)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS count,"
+                " COALESCE(SUM(notional_usd), 0) AS notional,"
+                " COALESCE(SUM(CASE WHEN status = 'filled'"
+                "   THEN notional_usd * expected_net_bps / 10000.0 ELSE 0 END), 0)"
+                "   AS realized_pnl"
+                " FROM trades WHERE ts >= ?",
+                (since_ts,),
+            ).fetchone()
+        return dict(row)
 
     def prune(self, retention_hours: float) -> None:
         cutoff = time.time() - retention_hours * 3600
