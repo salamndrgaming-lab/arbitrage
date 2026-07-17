@@ -46,3 +46,33 @@ def test_scan_gap_reuses_last_cycle(client):
 def test_index_and_static(client):
     assert "<title>Market Arbitrage Tracker</title>" in client.get("/").text
     assert client.get("/api/status").json()["history_available"] is False
+
+
+def test_trading_proxy_unconfigured(client, monkeypatch):
+    monkeypatch.setattr(webapp, "CONTROL_URL", "")
+    d = client.get("/api/trading/status").json()
+    assert d["connected"] is False and "ARB_CONTROL_URL" in d["reason"]
+    assert client.post("/api/trading/kill").status_code == 503
+    assert client.post("/api/trading/resume").status_code == 503
+
+
+def test_trading_proxy_configured(client, monkeypatch):
+    monkeypatch.setattr(webapp, "CONTROL_URL", "http://control.example")
+    calls = []
+
+    async def fake_control(method, path, client_token=None):
+        calls.append((method, path, client_token))
+        if path.endswith("/status"):
+            return 200, {"configured": True, "kill_switch": False}
+        return 200, {"kill_switch": path.endswith("/kill")}
+
+    monkeypatch.setattr(webapp, "_control_request", fake_control)
+
+    d = client.get("/api/trading/status").json()
+    assert d["connected"] is True and d["configured"] is True
+
+    assert client.post("/api/trading/kill").json()["kill_switch"] is True
+    r = client.post("/api/trading/resume", headers={"X-Control-Token": "tok"})
+    assert r.json()["kill_switch"] is False
+    # The client-supplied token is forwarded to the control endpoint.
+    assert ("POST", "/api/trading/resume", "tok") in calls

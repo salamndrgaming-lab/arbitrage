@@ -154,6 +154,23 @@
   .reftag { font-size: 10px; letter-spacing: .04em; text-transform: uppercase;
             border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; color: var(--text-muted); }
   .caveat { font-size: 12px; color: var(--text-muted); margin-top: 20px; }
+
+  .trow { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .tstate {
+    font-size: 12px; font-weight: 600; letter-spacing: .02em;
+    padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+  .tstate.ok { color: var(--good-text); border-color: var(--good); }
+  .tstate.danger { color: #fff; background: var(--critical); border-color: var(--critical); }
+  button.ctl {
+    font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--surface-1);
+    color: var(--text-primary); cursor: pointer;
+  }
+  button.ctl:hover:not(:disabled) { border-color: var(--baseline); }
+  button.ctl.danger { border-color: var(--critical); color: var(--critical); font-weight: 600; }
+  button.ctl:disabled { opacity: .45; cursor: default; }
 </style>
 </head>
 <body>
@@ -233,6 +250,12 @@
       <svg id="chart" height="240" role="img" aria-label="Best cross-venue spread over time in basis points"></svg>
       <div class="tooltip" id="chart-tip"></div>
     </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h2>Trading</h2>
+    <p class="hint">Supervises the self-hosted autonomous trader. The kill switch halts it before its next trade; releasing may require the control token. This page never holds exchange credentials.</p>
+    <div id="trading-body"><div class="empty">Checking trading control…</div></div>
   </div>
 
   <div class="card" style="margin-top:12px">
@@ -428,6 +451,75 @@ function renderMatrices(quotes, st) {
   }
 }
 
+/* ---- trading control panel ---- */
+function renderTrading(ts) {
+  const el = $("trading-body");
+  if (!ts) {
+    el.innerHTML = '<div class="empty">Trading control unavailable on this backend.</div>';
+    return;
+  }
+  if (!ts.connected) {
+    el.innerHTML = `<div class="empty">Not connected — ${ts.reason || "no control endpoint"}.</div>`;
+    return;
+  }
+  const state = ts.kill_switch
+    ? '<span class="tstate danger">KILL SWITCH ENGAGED</span>'
+    : ts.configured
+      ? '<span class="tstate ok">enabled — trades only when the trader process is armed</span>'
+      : '<span class="tstate">disarmed (trading.enabled: false)</span>';
+  const s = ts.stats_24h || { count: 0, notional: 0, realized_pnl: 0 };
+  const lim = ts.limits || {};
+  const rows = (ts.recent_trades || []).map((t) => `
+    <tr>
+      <td>${new Date(t.ts * 1000).toLocaleTimeString()}</td>
+      <td>${t.status}</td>
+      <td><strong>${t.base}</strong> <span class="mkt">${t.market}</span></td>
+      <td><span class="ex">${t.buy_exchange} → ${t.sell_exchange}</span></td>
+      <td class="num">$${(+t.notional_usd).toFixed(0)}</td>
+      <td class="num">${(+t.expected_net_bps).toFixed(1)} bps</td>
+    </tr>`).join("");
+  el.innerHTML = `
+    <div class="trow">${state}
+      <span class="ex">venues: ${(ts.venues || []).join(", ") || "—"} · assets: ${(ts.assets || []).join(", ") || "—"}</span>
+    </div>
+    <div class="trow ex">last 24 h: ${s.count} trades · $${(+s.notional).toFixed(0)} notional · est. realized $${(+s.realized_pnl).toFixed(2)}
+      &nbsp;·&nbsp; caps: $${lim.max_trade_notional_usd ?? "—"}/trade, $${lim.max_daily_notional_usd ?? "—"}/day, loss limit $${lim.max_daily_loss_usd ?? "—"}, execute ≥ ${lim.min_execute_bps ?? "—"} bps
+    </div>
+    ${rows ? `<div class="tblwrap"><table>
+        <thead><tr><th>Time</th><th>Status</th><th>Asset</th><th>Route</th>
+        <th class="num">Notional</th><th class="num">Expected net</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`
+      : '<div class="trow ex">no trades in the last 24 h</div>'}
+    <div class="trow">
+      <button class="ctl danger" id="btn-kill" ${ts.kill_switch ? "disabled" : ""}>Engage kill switch</button>
+      <button class="ctl" id="btn-resume" ${ts.kill_switch ? "" : "disabled"}>Release kill switch</button>
+    </div>`;
+  $("btn-kill").onclick = engageKill;
+  $("btn-resume").onclick = releaseKill;
+}
+
+async function engageKill() {
+  if (!confirm("Engage the kill switch? The trader halts before its next trade and stays halted until released.")) return;
+  try { await fetch("/api/trading/kill", { method: "POST" }); } catch (e) {}
+  refresh();
+}
+
+async function releaseKill() {
+  if (!confirm("Release the kill switch and allow the trader to resume?")) return;
+  try {
+    let r = await fetch("/api/trading/resume", { method: "POST" });
+    if (r.status === 403) {
+      const tok = prompt("Control token required to release the kill switch:");
+      if (tok) {
+        r = await fetch("/api/trading/resume", { method: "POST",
+                        headers: { "X-Control-Token": tok } });
+        if (r.status === 403) alert("Invalid control token.");
+      }
+    }
+  } catch (e) {}
+  refresh();
+}
+
 /* ---- spread history chart: 2px lines, hairline grid, crosshair + tooltip ---- */
 const chart = { pts: [] };
 
@@ -553,6 +645,11 @@ async function refresh() {
     renderMatrices(data.quotes, st);
     recordHistory(st, data.best_spreads);
     await updateChart(st);
+    try {
+      renderTrading(await getJSON("/api/trading/status"));
+    } catch (e) {
+      renderTrading(null);
+    }
   } catch (err) {
     $("updated").textContent = "connection lost — retrying…";
   } finally {

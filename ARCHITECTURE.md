@@ -101,8 +101,28 @@ behavior to something a human can watch.
 - **Trader (`python -m arb.trade run`)** — separate process, same DB, same
   machine. Deliberately not embedded in the web server: the dashboard can
   restart without touching trading, and vice versa.
-- **Vercel (`api/index.py`)** — observation only. Serverless instances are
-  ephemeral and anonymous-facing; they must never hold trading credentials.
+- **Vercel (`api/index.py`)** — observation plus a **control proxy**.
+  Serverless instances are ephemeral and anonymous-facing; they never hold
+  exchange credentials or run the trader.
+
+## Trading control plane
+
+The dashboard's Trading panel (both deployments) drives three endpoints:
+
+- `GET /api/trading/status` — configured/kill-switch state, limits, 24h
+  stats, last audit rows.
+- `POST /api/trading/kill` — creates the kill-switch file. Deliberately
+  unauthenticated: an emergency stop must never be locked, and abusing it
+  can only *stop* trading.
+- `POST /api/trading/resume` — removes the kill-switch file. Requires the
+  `X-Control-Token` header when `ARB_CONTROL_TOKEN` is set on the server.
+
+On the self-hosted server these act on the local kill-switch file the trader
+watches (same host, same working directory). On Vercel they proxy to the
+self-hosted server when `ARB_CONTROL_URL` (+ `ARB_CONTROL_TOKEN`) are set as
+deployment environment variables; unconfigured, the panel reports "not
+connected" — no dead buttons, no pretend state. Access to the Vercel page
+itself is additionally gated by Vercel Deployment Protection.
 
 ## Roadmap (in order)
 

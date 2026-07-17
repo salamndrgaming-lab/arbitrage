@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -65,6 +65,71 @@ async def scan():
 @app.get("/api/status")
 def status():
     return _snapshot()
+
+
+# -- trading control proxy --------------------------------------------------
+# This deployment never holds exchange credentials or runs the trader. When
+# ARB_CONTROL_URL (and optionally ARB_CONTROL_TOKEN) point at the self-hosted
+# server's control plane, these endpoints proxy to it so the hosted dashboard
+# can supervise the trader; otherwise they report "not connected" honestly.
+
+CONTROL_URL = os.environ.get("ARB_CONTROL_URL", "").rstrip("/")
+CONTROL_TOKEN = os.environ.get("ARB_CONTROL_TOKEN", "")
+
+
+async def _control_request(method: str, path: str,
+                           client_token: str | None = None) -> tuple[int, dict]:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=8)
+    headers = {}
+    token = CONTROL_TOKEN or client_token
+    if token:
+        headers["X-Control-Token"] = token
+    resp = await _client.request(method, f"{CONTROL_URL}{path}", headers=headers)
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {"detail": resp.text[:200]}
+    return resp.status_code, body
+
+
+@app.get("/api/trading/status")
+async def trading_status():
+    if not CONTROL_URL:
+        return {"connected": False,
+                "reason": "no control endpoint configured — set ARB_CONTROL_URL"
+                          " (and ARB_CONTROL_TOKEN) on this deployment"}
+    try:
+        code, body = await _control_request("GET", "/api/trading/status")
+    except httpx.HTTPError as exc:
+        return {"connected": False, "reason": f"control endpoint unreachable: {exc}"}
+    if code != 200:
+        return {"connected": False, "reason": f"control endpoint returned HTTP {code}"}
+    body["connected"] = True
+    return body
+
+
+@app.post("/api/trading/kill")
+async def trading_kill(response: Response):
+    if not CONTROL_URL:
+        response.status_code = 503
+        return {"detail": "no control endpoint configured"}
+    code, body = await _control_request("POST", "/api/trading/kill")
+    response.status_code = code
+    return body
+
+
+@app.post("/api/trading/resume")
+async def trading_resume(response: Response,
+                         x_control_token: str | None = Header(None)):
+    if not CONTROL_URL:
+        response.status_code = 503
+        return {"detail": "no control endpoint configured"}
+    code, body = await _control_request("POST", "/api/trading/resume",
+                                        client_token=x_control_token)
+    response.status_code = code
+    return body
 
 
 @app.get("/")

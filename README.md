@@ -155,6 +155,13 @@ partial, or failed — lands in the `trades` audit table (visible at
 `/api/trades` on the self-hosted server). Trading never runs on the Vercel
 deployment; it is a separate self-hosted process.
 
+The dashboard's **Trading panel** shows armed/kill-switch state, limits,
+24-hour stats and the latest audit rows, with one-click **kill switch**
+engage (release is token-gated via `ARB_CONTROL_TOKEN`). On the Vercel
+deployment the panel proxies to your self-hosted server: set
+`ARB_CONTROL_URL` (and `ARB_CONTROL_TOKEN`) in the Vercel project's
+environment variables; until then it reports "not connected".
+
 Start with the default caps ($100/trade, $1,000/day) and exchange
 sub-accounts holding only what you are prepared to lose. Cross-exchange
 crypto arbitrage spreads are usually thinner than fees + slippage; expect

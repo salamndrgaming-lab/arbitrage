@@ -189,3 +189,47 @@ def test_api_endpoints(tmp_path, monkeypatch):
         assert client.get("/api/history?asset=NOPE").status_code == 404
         assert "<title>Market Arbitrage Tracker</title>" in client.get("/").text
     server.store.close()
+
+
+def test_trading_control_endpoints(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ARB_DB", str(tmp_path / "ctl.sqlite3"))
+    monkeypatch.delenv("ARB_CONTROL_TOKEN", raising=False)
+    import importlib
+    import arb.server as server
+    importlib.reload(server)
+
+    cfg = make_cfg(tmp_path)
+    cfg.trading.kill_switch_file = str(tmp_path / "KILL")
+    server.cfg = cfg
+    server.poller = Poller(cfg, server.store, adapters={"v": StubVenue("v")})
+
+    with TestClient(server.app) as client:
+        st = client.get("/api/trading/status").json()
+        assert st["connected"] is True
+        assert st["configured"] is False  # trading disabled by default
+        assert st["kill_switch"] is False
+        assert "max_trade_notional_usd" in st["limits"]
+        assert client.get("/api/trades").json()["trades"] == []
+
+        # Engaging the kill switch needs no token — emergency stop.
+        assert client.post("/api/trading/kill").json()["kill_switch"] is True
+        assert (tmp_path / "KILL").exists()
+        assert client.get("/api/trading/status").json()["kill_switch"] is True
+
+        # Releasing is token-gated when a control token is configured.
+        monkeypatch.setenv("ARB_CONTROL_TOKEN", "sekrit")
+        assert client.post("/api/trading/resume").status_code == 403
+        assert (tmp_path / "KILL").exists()
+        ok = client.post("/api/trading/resume",
+                         headers={"X-Control-Token": "sekrit"})
+        assert ok.status_code == 200
+        assert not (tmp_path / "KILL").exists()
+
+        # Without a configured token, release is open (local single-user).
+        monkeypatch.delenv("ARB_CONTROL_TOKEN")
+        client.post("/api/trading/kill")
+        assert client.post("/api/trading/resume").status_code == 200
+    server.store.close()

@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -113,6 +114,52 @@ def trades(hours: float = Query(24.0, gt=0, le=720), limit: int = Query(200, le=
         "trades": store.recent_trades(hours, limit),
         "stats_24h": store.trade_stats_since(time.time() - 24 * 3600),
     }
+
+
+# -- trading control plane --------------------------------------------------
+# The trader is a separate process on the same host sharing this working
+# directory: the kill-switch file is the coordination mechanism, and the DB
+# is the audit trail. Engaging the kill switch is deliberately unauthenticated
+# (an emergency stop must never be locked); releasing it requires the control
+# token when ARB_CONTROL_TOKEN is set.
+
+
+@app.get("/api/trading/status")
+def trading_status():
+    t = cfg.trading
+    return {
+        "connected": True,
+        "configured": t.enabled,
+        "kill_switch": os.path.exists(t.kill_switch_file),
+        "venues": t.venues,
+        "assets": t.assets,
+        "limits": {
+            "min_execute_bps": t.min_execute_bps,
+            "max_trade_notional_usd": t.max_trade_notional_usd,
+            "max_daily_notional_usd": t.max_daily_notional_usd,
+            "max_trades_per_day": t.max_trades_per_day,
+            "max_daily_loss_usd": t.max_daily_loss_usd,
+        },
+        "stats_24h": store.trade_stats_since(time.time() - 24 * 3600),
+        "recent_trades": store.recent_trades(hours=24, limit=5),
+    }
+
+
+@app.post("/api/trading/kill")
+def trading_kill():
+    Path(cfg.trading.kill_switch_file).write_text(
+        f"engaged via API at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+    return {"kill_switch": True}
+
+
+@app.post("/api/trading/resume")
+def trading_resume(x_control_token: str | None = Header(None)):
+    token = os.environ.get("ARB_CONTROL_TOKEN", "")
+    if token and x_control_token != token:
+        raise HTTPException(403, "control token required to release the kill switch")
+    Path(cfg.trading.kill_switch_file).unlink(missing_ok=True)
+    return {"kill_switch": False}
 
 
 @app.get("/")
