@@ -74,6 +74,14 @@ class ExecutionVenue:
     ) -> OrderResult:
         raise NotImplementedError
 
+    async def place_market(
+        self, client: httpx.AsyncClient, base: str, quote: str,
+        side: str, qty: float,
+    ) -> OrderResult:
+        """Market order — used ONLY to unwind one-sided exposure, never
+        to enter a position (entries are IOC limit and cannot chase)."""
+        raise NotImplementedError
+
 
 class BinanceExecution(ExecutionVenue):
     name = "binance"
@@ -124,6 +132,34 @@ class BinanceExecution(ExecutionVenue):
             requested_qty=qty,
             filled_qty=float(data.get("executedQty", 0)),
             price=price,
+            order_id=str(data.get("orderId", "")),
+            raw_status=data.get("status", "?"),
+        )
+
+    async def place_market(self, client, base, quote, side, qty):
+        symbol = f"{base}{quote}"
+        params = self._signed({
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": f"{qty:.8f}".rstrip("0").rstrip("."),
+            "newOrderRespType": "RESULT",
+        })
+        resp = await client.post(
+            f"{self.BASE}/api/v3/order", params=params, headers=self._headers()
+        )
+        if resp.status_code != 200:
+            raise ExecutionError(
+                f"binance market order: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        data = resp.json()
+        executed = float(data.get("executedQty", 0))
+        spent = float(data.get("cummulativeQuoteQty", 0))
+        return OrderResult(
+            venue=self.name, side=side, symbol=symbol,
+            requested_qty=qty,
+            filled_qty=executed,
+            price=spent / executed if executed else 0.0,
             order_id=str(data.get("orderId", "")),
             raw_status=data.get("status", "?"),
         )
@@ -194,6 +230,34 @@ class KrakenExecution(ExecutionVenue):
         return OrderResult(
             venue=self.name, side=side, symbol=pair,
             requested_qty=qty, filled_qty=filled, price=price,
+            order_id=",".join(txids) or "?",
+            raw_status="submitted",
+        )
+
+    async def place_market(self, client, base, quote, side, qty):
+        pair = f"{self.CODES.get(base, base)}{quote}"
+        result = await self._private(client, "/0/private/AddOrder", {
+            "pair": pair,
+            "type": side.lower(),
+            "ordertype": "market",
+            "volume": f"{qty:.8f}".rstrip("0").rstrip("."),
+        })
+        txids = result.get("txid", [])
+        filled, avg_price = qty, 0.0
+        if txids:
+            try:
+                orders = await self._private(
+                    client, "/0/private/QueryOrders", {"txid": ",".join(txids)}
+                )
+                filled = sum(float(o.get("vol_exec", 0)) for o in orders.values())
+                avg_price = max(
+                    (float(o.get("price", 0)) for o in orders.values()), default=0.0
+                )
+            except ExecutionError:
+                filled = 0.0  # unknown -> treat as unfilled so the trader flags it
+        return OrderResult(
+            venue=self.name, side=side, symbol=pair,
+            requested_qty=qty, filled_qty=filled, price=avg_price,
             order_id=",".join(txids) or "?",
             raw_status="submitted",
         )

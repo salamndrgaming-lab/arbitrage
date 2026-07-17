@@ -77,18 +77,28 @@ behavior to something a human can watch.
 | Per-asset cooldown | 60 s | `risk.evaluate` |
 | Venue / asset / market allowlists | binance+kraken, BTC+ETH, crypto | `risk.evaluate` |
 | Balance pre-check on both legs (with fee headroom) | always | `trader._check_balances` |
-| IOC-only orders (no resting orders, no market orders) | always | `execution.py` |
+| IOC-only entries (no resting orders; market orders only to unwind) | always | `execution.py` |
 | Circuit breaker: N consecutive failures → disarm until restart | 3 | `risk.record_result` |
 | Partial fill counts as a failure (one-sided exposure) | always | `trader._execute` |
+| Auto-unwind of partials: market-out the overfilled leg immediately | on (`unwind_partials`) | `trader._unwind` |
+| Failed unwind → breaker trips instantly (naked exposure) | always | `trader._unwind` |
 | Full audit trail (every attempt, including failures) | always | `store.trades` |
 | Trading code excluded from serverless deploys | always | `webapp.py` never imports `arb.trading` |
 | Credentials only via environment, never config/logs | always | `execution.from_env` |
 
 ## Failure handling
 
-- **One leg errors, one fills** → recorded as `partial`, counts toward the
-  circuit breaker; the operator resolves the one-sided position manually.
-  Automatic unwind (market-out the filled leg) is the top roadmap item.
+- **One leg errors or underfills** → recorded as `partial`, counts toward
+  the circuit breaker, and the net exposure is **auto-unwound**: the
+  overfilled leg is immediately market-ordered back on the venue where it
+  filled (excess buys are sold back on the buy venue; excess sells are
+  bought back on the sell venue), bounding one-sided exposure to seconds.
+  The unwind is audited as `unwound` / `unwind_partial` / `unwind_failed`
+  and its notional counts against the daily caps.
+- **Unwind fails or underfills** → the breaker trips immediately: the
+  process is holding an unhedged position and must stop; the operator
+  resolves it manually. Both legs partially filling by the same amount
+  leaves inventory flat — recorded as `partial`, nothing to unwind.
 - **Both legs error** → `failed`, circuit breaker increments, nothing moved.
 - **Any uncaught exception in a cycle** → logged, counted as a failure.
 - **Circuit breaker trips** → loop exits; restart is a deliberate human act.
@@ -126,14 +136,15 @@ itself is additionally gated by Vercel Deployment Protection.
 
 ## Roadmap (in order)
 
-1. **Auto-unwind of partial fills** — market-out the filled leg immediately,
-   bounding one-sided exposure to seconds.
-2. **Venue precision filters** — pull `exchangeInfo` / `AssetPairs` lot/tick
+1. **Venue precision filters** — pull `exchangeInfo` / `AssetPairs` lot/tick
    rules instead of coarse rounding (today a precision miss safely rejects).
-3. **WebSocket order books** — depth-aware sizing and sub-second quotes to
+2. **WebSocket order books** — depth-aware sizing and sub-second quotes to
    replace REST top-of-book polling.
-4. **Inventory tracking + rebalancing alerts** — track per-venue inventory
+3. **Inventory tracking + rebalancing alerts** — track per-venue inventory
    drift, alert (not act) when a transfer is worth it.
-5. **FX/metals execution** — extend execution adapters to Kraken/Bitstamp
+4. **FX/metals execution** — extend execution adapters to Kraken/Bitstamp
    fiat pairs and PAXG once crypto-leg behavior is proven.
-6. **Notifications** — push/webhook on trade, partial, or breaker trip.
+5. **Notifications** — push/webhook on trade, partial, or breaker trip.
+
+Done: ~~auto-unwind of partial fills~~ — partials are market-ed out
+immediately (`trader._unwind`), and a failed unwind trips the breaker.

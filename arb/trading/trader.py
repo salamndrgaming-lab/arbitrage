@@ -8,7 +8,9 @@ is written to the audit trail before the next cycle starts.
 
 Arming is all-or-nothing (see ``arm_check``); a partial fill or any
 execution error counts toward the circuit breaker, which permanently
-disarms the process until a human restarts it.
+disarms the process until a human restarts it. A partial that leaves
+one-sided exposure is auto-unwound (market-out the overfilled leg on the
+venue it filled on); a failed unwind trips the breaker immediately.
 """
 
 from __future__ import annotations
@@ -116,28 +118,75 @@ class Trader:
         buy_res, sell_res = results
         buy_err = isinstance(buy_res, BaseException)
         sell_err = isinstance(sell_res, BaseException)
+        buy_filled = 0.0 if buy_err else buy_res.filled_qty
+        sell_filled = 0.0 if sell_err else sell_res.filled_qty
 
-        if buy_err or sell_err:
-            status = "failed" if buy_err and sell_err else "partial"
-            detail = "; ".join(
-                f"{leg}: {res}" for leg, res in (("buy", buy_res), ("sell", sell_res))
-                if isinstance(res, BaseException)
-            )
-            log.error("trade %s %s: %s", opp.base, status, detail)
-            self.store.record_trade(opp, qty, notional, status, detail)
-            self.risk.record_result(False)
-            return
+        if buy_err and sell_err:
+            status = "failed"
+        elif buy_err or sell_err or not (buy_res.fully_filled
+                                         and sell_res.fully_filled):
+            status = "partial"
+        else:
+            status = "filled"
 
-        both_filled = buy_res.fully_filled and sell_res.fully_filled
-        status = "filled" if both_filled else "partial"
-        detail = (f"buy {buy_res.filled_qty}/{qty} @{buy_res.price}"
-                  f" ({buy_res.raw_status}); sell {sell_res.filled_qty}/{qty}"
-                  f" @{sell_res.price} ({sell_res.raw_status})")
-        log.info("trade %s %s: %s", opp.base, status, detail)
+        def leg(name: str, res) -> str:
+            if isinstance(res, BaseException):
+                return f"{name}: {res}"
+            return f"{name} {res.filled_qty}/{qty} @{res.price} ({res.raw_status})"
+
+        detail = f"{leg('buy', buy_res)}; {leg('sell', sell_res)}"
+        (log.info if status == "filled" else log.error)(
+            "trade %s %s: %s", opp.base, status, detail)
         self.store.record_trade(opp, qty, notional, status, detail)
         # A partial leaves one-sided inventory exposure -> counts as a failure
         # for the circuit breaker even though nothing errored.
-        self.risk.record_result(both_filled)
+        self.risk.record_result(status == "filled")
+
+        if status != "filled":
+            await self._unwind(client, opp, qty, buy_filled - sell_filled)
+
+    async def _unwind(self, client: httpx.AsyncClient, opp: Opportunity,
+                      qty: float, delta: float) -> None:
+        """Flatten one-sided exposure left by a partial/failed trade.
+
+        ``delta`` is net base bought minus net base sold. Positive means
+        excess inventory sits on the buy venue (sell it back there);
+        negative means we over-sold on the sell venue (buy it back there).
+        Market-out immediately so exposure lives for seconds, not until a
+        human notices. If the unwind itself fails, trip the breaker — we
+        are holding an unhedged position and must stop trading.
+        """
+        if not self.cfg.trading.unwind_partials:
+            return
+        if abs(delta) < qty * 0.001:
+            return  # legs matched (or nothing filled): already flat
+        if delta > 0:
+            venue, side, unwind_qty = opp.buy_exchange, "sell", delta
+            quote, ref_price = opp.buy_quote, opp.buy_price
+        else:
+            venue, side, unwind_qty = opp.sell_exchange, "buy", -delta
+            quote, ref_price = opp.sell_quote, opp.sell_price
+        try:
+            res = await self.executors[venue].place_market(
+                client, opp.base, quote, side, unwind_qty)
+        except Exception as exc:
+            log.critical(
+                "UNWIND FAILED — %s %.8f %s on %s left un-flattened: %s",
+                side, unwind_qty, opp.base, venue, exc)
+            self.store.record_trade(
+                opp, unwind_qty, unwind_qty * ref_price, "unwind_failed",
+                f"market {side} {unwind_qty:.8f} {opp.base} on {venue}: {exc}")
+            self.risk.trip()
+            return
+        flat = res.fully_filled
+        status = "unwound" if flat else "unwind_partial"
+        detail = (f"market {side} {res.filled_qty}/{unwind_qty:.8f} {opp.base}"
+                  f" on {venue} @{res.price} ({res.raw_status})")
+        (log.warning if flat else log.critical)("unwind %s: %s", status, detail)
+        self.store.record_trade(opp, unwind_qty, unwind_qty * ref_price,
+                                status, detail)
+        if not flat:
+            self.risk.trip()
 
     # ------------------------------------------------------------------
 
@@ -206,6 +255,7 @@ class Trader:
                 "max_daily_notional_usd": self.cfg.trading.max_daily_notional_usd,
                 "max_trades_per_day": self.cfg.trading.max_trades_per_day,
                 "max_daily_loss_usd": self.cfg.trading.max_daily_loss_usd,
+                "unwind_partials": self.cfg.trading.unwind_partials,
             },
             "venues": list(self.executors),
             "assets": self.cfg.trading.assets,

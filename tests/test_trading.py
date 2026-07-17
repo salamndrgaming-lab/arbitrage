@@ -171,12 +171,16 @@ def test_kraken_signature_shape():
 
 
 class StubExecutor(ExecutionVenue):
-    def __init__(self, name, balances=None, fail=False, fill_ratio=1.0):
+    def __init__(self, name, balances=None, fail=False, fill_ratio=1.0,
+                 market_fail=False, market_fill_ratio=1.0):
         self.name = name
         self._balances = balances or {"USD": 1e6, "USDT": 1e6, "BTC": 10, "ETH": 100}
         self.fail = fail
         self.fill_ratio = fill_ratio
+        self.market_fail = market_fail
+        self.market_fill_ratio = market_fill_ratio
         self.orders = []
+        self.market_orders = []
 
     async def balances(self, client):
         return self._balances
@@ -188,10 +192,19 @@ class StubExecutor(ExecutionVenue):
         return OrderResult(self.name, side, f"{base}{quote}", qty,
                            qty * self.fill_ratio, price, "oid-1", "FILLED")
 
+    async def place_market(self, client, base, quote, side, qty):
+        if self.market_fail:
+            raise ExecutionError(f"{self.name}: market rejected")
+        self.market_orders.append((side, base, quote, qty))
+        return OrderResult(self.name, side, f"{base}{quote}", qty,
+                           qty * self.market_fill_ratio, 100_000.0, "oid-m", "FILLED")
 
-def make_trader(tmp_path, monkeypatch, buy_venue=None, sell_venue=None, spread_bps=80):
+
+def make_trader(tmp_path, monkeypatch, buy_venue=None, sell_venue=None,
+                spread_bps=80, **cfg_overrides):
     monkeypatch.setenv(ARMING_ENV, ARMING_PHRASE)
-    cfg = trading_cfg(tmp_path, min_execute_bps=30, cooldown_seconds=0)
+    cfg = trading_cfg(tmp_path, min_execute_bps=30, cooldown_seconds=0,
+                      **cfg_overrides)
     store = Store(cfg.db_path)
     # Market data: kraken cheap, binance rich -> buy kraken, sell binance.
     poller = Poller(cfg, store, adapters={
@@ -229,8 +242,10 @@ def test_trader_executes_and_audits(tmp_path, monkeypatch):
     store.close()
 
 
-def test_trader_partial_counts_as_failure(tmp_path, monkeypatch):
-    trader, store, _ = make_trader(
+def test_trader_partial_counts_as_failure_and_unwinds(tmp_path, monkeypatch):
+    # Sell leg fills only 40% -> we bought more than we sold; the excess
+    # base on the buy venue (kraken) must be market-sold back immediately.
+    trader, store, executors = make_trader(
         tmp_path, monkeypatch,
         sell_venue=StubExecutor("binance", fill_ratio=0.4),
     )
@@ -240,8 +255,92 @@ def test_trader_partial_counts_as_failure(tmp_path, monkeypatch):
             await trader.run_cycle(client)
 
     run(go())
+    trades = store.recent_trades()  # newest first
+    assert [t["status"] for t in trades] == ["unwound", "partial"]
+    assert trader.risk.consecutive_failures == 1
+    assert not trader.risk.tripped
+
+    (side, base, quote, uq), = executors["kraken"].market_orders
+    assert (side, base) == ("sell", "BTC")
+    assert uq == pytest.approx(trades[1]["qty"] * 0.6)
+    assert executors["binance"].market_orders == []
+    store.close()
+
+
+def test_trader_unwinds_when_one_leg_errors(tmp_path, monkeypatch):
+    # Buy leg rejected, sell leg fully filled -> we are short base on the
+    # sell venue (binance); buy the full qty back there at market.
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch,
+        buy_venue=StubExecutor("kraken", fail=True),
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
     trades = store.recent_trades()
-    assert trades[0]["status"] == "partial"
+    assert [t["status"] for t in trades] == ["unwound", "partial"]
+    (side, base, quote, uq), = executors["binance"].market_orders
+    assert (side, base) == ("buy", "BTC")
+    assert uq == pytest.approx(trades[1]["qty"])
+    assert executors["kraken"].market_orders == []
+    store.close()
+
+
+def test_failed_unwind_trips_breaker(tmp_path, monkeypatch):
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch,
+        sell_venue=StubExecutor("binance", fill_ratio=0.4),
+    )
+    executors["kraken"].market_fail = True
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    trades = store.recent_trades()
+    assert [t["status"] for t in trades] == ["unwind_failed", "partial"]
+    assert trader.risk.tripped  # naked exposure -> immediate halt
+    store.close()
+
+
+def test_unwind_can_be_disabled(tmp_path, monkeypatch):
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch, unwind_partials=False,
+        sell_venue=StubExecutor("binance", fill_ratio=0.4),
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    assert [t["status"] for t in store.recent_trades()] == ["partial"]
+    assert executors["kraken"].market_orders == []
+    assert executors["binance"].market_orders == []
+    store.close()
+
+
+def test_no_unwind_when_legs_match(tmp_path, monkeypatch):
+    # Both legs partially fill by the same ratio: inventory is flat, so a
+    # partial is recorded (breaker counts it) but nothing is unwound.
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch,
+        buy_venue=StubExecutor("kraken", fill_ratio=0.5),
+        sell_venue=StubExecutor("binance", fill_ratio=0.5),
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    assert [t["status"] for t in store.recent_trades()] == ["partial"]
+    assert executors["kraken"].market_orders == []
+    assert executors["binance"].market_orders == []
     assert trader.risk.consecutive_failures == 1
     store.close()
 
@@ -259,8 +358,13 @@ def test_trader_circuit_breaker_stops_trading(tmp_path, monkeypatch):
 
     run(go())
     assert trader.risk.tripped
-    # Exactly max_consecutive_failures attempts, then no more.
-    assert len(store.recent_trades()) == trader.cfg.trading.max_consecutive_failures
+    # Exactly max_consecutive_failures attempts (each: one partial + its
+    # unwind of the filled sell leg), then no more.
+    trades = store.recent_trades()
+    n = trader.cfg.trading.max_consecutive_failures
+    assert len(trades) == 2 * n
+    assert sum(t["status"] == "partial" for t in trades) == n
+    assert sum(t["status"] == "unwound" for t in trades) == n
     store.close()
 
 

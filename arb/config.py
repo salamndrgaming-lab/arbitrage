@@ -67,6 +67,10 @@ class TradingConfig:
     max_quote_age_seconds: float = 3.0
     max_consecutive_failures: int = 3
     kill_switch_file: str = "TRADING_KILL_SWITCH"
+    # Market-out the overfilled leg of a partial immediately, bounding
+    # one-sided exposure to seconds. Disable only if you prefer to resolve
+    # partials by hand — an unwind failure trips the circuit breaker.
+    unwind_partials: bool = True
 
 
 @dataclass
@@ -181,6 +185,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
             max_consecutive_failures=int(
                 raw_trading.get("max_consecutive_failures", t.max_consecutive_failures)),
             kill_switch_file=raw_trading.get("kill_switch_file", t.kill_switch_file),
+            unwind_partials=bool(raw_trading.get("unwind_partials", t.unwind_partials)),
         )
 
     if os.environ.get("ARB_DB"):

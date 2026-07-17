@@ -48,6 +48,12 @@ class RiskManager:
 
     # -- circuit breaker --------------------------------------------------
 
+    def trip(self) -> None:
+        """Trip the breaker directly — used when an unwind fails and
+        one-sided exposure is left un-flattened. Trading halts until a
+        human restarts the process."""
+        self.tripped = True
+
     def record_result(self, success: bool) -> None:
         if success:
             self.consecutive_failures = 0

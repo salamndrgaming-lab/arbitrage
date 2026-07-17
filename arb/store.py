@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS trades (
     notional_usd REAL NOT NULL,
     expected_net_bps REAL NOT NULL,
     status TEXT NOT NULL,          -- filled | partial | failed
+                                   -- | unwound | unwind_partial | unwind_failed
     detail TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades (ts);

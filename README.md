@@ -150,10 +150,13 @@ touch TRADING_KILL_SWITCH    # halt trading immediately, no deploy needed
 Every trade passes a risk gate first: per-trade/daily notional caps, daily
 loss limit, trade-count cap, per-asset cooldown, stale-quote rejection,
 venue/asset allowlists, balance pre-checks on both legs, and a circuit
-breaker that disarms after consecutive failures. Every attempt — filled,
-partial, or failed — lands in the `trades` audit table (visible at
-`/api/trades` on the self-hosted server). Trading never runs on the Vercel
-deployment; it is a separate self-hosted process.
+breaker that disarms after consecutive failures. A partial fill is
+**auto-unwound**: the overfilled leg is immediately market-ordered back on
+the venue where it filled, so one-sided exposure lives for seconds — and if
+the unwind itself fails, the breaker trips on the spot. Every attempt —
+filled, partial, failed, or unwind — lands in the `trades` audit table
+(visible at `/api/trades` on the self-hosted server). Trading never runs on
+the Vercel deployment; it is a separate self-hosted process.
 
 The dashboard's **Trading panel** shows armed/kill-switch state, limits,
 24-hour stats and the latest audit rows, with one-click **kill switch**

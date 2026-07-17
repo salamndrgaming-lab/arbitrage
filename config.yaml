@@ -58,3 +58,4 @@ trading:
   max_quote_age_seconds: 3      # never trade on stale quotes
   max_consecutive_failures: 3   # circuit breaker: then disarm until restart
   kill_switch_file: TRADING_KILL_SWITCH
+  unwind_partials: true         # market-out the overfilled leg of a partial
