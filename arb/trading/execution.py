@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import math
 import os
 import time
 import urllib.parse
@@ -26,6 +27,28 @@ import httpx
 
 class ExecutionError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class PairRules:
+    """Venue trading rules for one pair. Zero means 'no constraint'."""
+
+    qty_step: float = 0.0       # lot size increment
+    price_tick: float = 0.0     # price increment
+    min_qty: float = 0.0        # minimum order size in base units
+    min_notional: float = 0.0   # minimum order value in quote units
+
+
+def floor_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.floor(value / step + 1e-9) * step
+
+
+def ceil_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.ceil(value / step - 1e-9) * step
 
 
 @dataclass(frozen=True)
@@ -63,6 +86,18 @@ class ExecutionVenue:
     def __init__(self, api_key: str, api_secret: str):
         self._key = api_key
         self._secret = api_secret
+        self._rules: dict[str, PairRules] = {}
+
+    async def pair_rules(
+        self, client: httpx.AsyncClient, base: str, quote: str
+    ) -> PairRules:
+        """Lot/tick/minimum rules for a pair; unconstrained by default.
+
+        Real venues fetch from public metadata endpoints and cache for the
+        process lifetime (these rules change rarely, and a stale rule at
+        worst gets an order rejected — never a bad fill).
+        """
+        return PairRules()
 
     async def balances(self, client: httpx.AsyncClient) -> dict[str, float]:
         """Free balances by currency code (uppercase)."""
@@ -96,6 +131,33 @@ class BinanceExecution(ExecutionVenue):
 
     def _headers(self) -> dict:
         return {"X-MBX-APIKEY": self._key}
+
+    async def pair_rules(self, client, base, quote):
+        symbol = f"{base}{quote}"
+        if symbol in self._rules:
+            return self._rules[symbol]
+        resp = await client.get(
+            f"{self.BASE}/api/v3/exchangeInfo", params={"symbol": symbol}
+        )
+        if resp.status_code != 200:
+            raise ExecutionError(
+                f"binance exchangeInfo: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        symbols = resp.json().get("symbols", [])
+        if not symbols:
+            raise ExecutionError(f"binance: unknown symbol {symbol}")
+        filters = {f.get("filterType"): f for f in symbols[0].get("filters", [])}
+        lot = filters.get("LOT_SIZE", {})
+        tick = filters.get("PRICE_FILTER", {})
+        notional = filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {}))
+        rules = PairRules(
+            qty_step=float(lot.get("stepSize", 0) or 0),
+            price_tick=float(tick.get("tickSize", 0) or 0),
+            min_qty=float(lot.get("minQty", 0) or 0),
+            min_notional=float(notional.get("minNotional", 0) or 0),
+        )
+        self._rules[symbol] = rules
+        return rules
 
     async def balances(self, client):
         resp = await client.get(
@@ -197,6 +259,33 @@ class KrakenExecution(ExecutionVenue):
         if payload.get("error"):
             raise ExecutionError(f"kraken: {payload['error']}")
         return payload.get("result", {})
+
+    async def pair_rules(self, client, base, quote):
+        pair = f"{self.CODES.get(base, base)}{quote}"
+        if pair in self._rules:
+            return self._rules[pair]
+        resp = await client.get(
+            f"{self.BASE}/0/public/AssetPairs", params={"pair": pair}
+        )
+        if resp.status_code != 200:
+            raise ExecutionError(
+                f"kraken AssetPairs: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        payload = resp.json()
+        if payload.get("error"):
+            raise ExecutionError(f"kraken AssetPairs: {payload['error']}")
+        result = payload.get("result", {})
+        if not result:
+            raise ExecutionError(f"kraken: unknown pair {pair}")
+        info = next(iter(result.values()))
+        rules = PairRules(
+            qty_step=10.0 ** -int(info.get("lot_decimals", 8)),
+            price_tick=10.0 ** -int(info.get("pair_decimals", 6)),
+            min_qty=float(info.get("ordermin", 0) or 0),
+            min_notional=float(info.get("costmin", 0) or 0),
+        )
+        self._rules[pair] = rules
+        return rules
 
     async def balances(self, client):
         result = await self._private(client, "/0/private/Balance", {})

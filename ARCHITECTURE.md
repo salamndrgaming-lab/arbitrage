@@ -82,6 +82,7 @@ behavior to something a human can watch.
 | Partial fill counts as a failure (one-sided exposure) | always | `trader._execute` |
 | Auto-unwind of partials: market-out the overfilled leg immediately | on (`unwind_partials`) | `trader._unwind` |
 | Failed unwind → breaker trips instantly (naked exposure) | always | `trader._unwind` |
+| Venue lot/tick/minimum rules enforced pre-trade (fail closed) | always | `trader._apply_precision` |
 | Full audit trail (every attempt, including failures) | always | `store.trades` |
 | Trading code excluded from serverless deploys | always | `webapp.py` never imports `arb.trading` |
 | Credentials only via environment, never config/logs | always | `execution.from_env` |
@@ -98,7 +99,10 @@ behavior to something a human can watch.
 - **Unwind fails or underfills** → the breaker trips immediately: the
   process is holding an unhedged position and must stop; the operator
   resolves it manually. Both legs partially filling by the same amount
-  leaves inventory flat — recorded as `partial`, nothing to unwind.
+  leaves inventory flat — recorded as `partial`, nothing to unwind. A
+  residual below the venue's minimum order size cannot be traded at all —
+  it is recorded as `unwind_dust` (exposure bounded by one lot) without
+  tripping the breaker.
 - **Both legs error** → `failed`, circuit breaker increments, nothing moved.
 - **Any uncaught exception in a cycle** → logged, counted as a failure.
 - **Circuit breaker trips** → loop exits; restart is a deliberate human act.
@@ -136,15 +140,20 @@ itself is additionally gated by Vercel Deployment Protection.
 
 ## Roadmap (in order)
 
-1. **Venue precision filters** — pull `exchangeInfo` / `AssetPairs` lot/tick
-   rules instead of coarse rounding (today a precision miss safely rejects).
-2. **WebSocket order books** — depth-aware sizing and sub-second quotes to
+1. **WebSocket order books** — depth-aware sizing and sub-second quotes to
    replace REST top-of-book polling.
-3. **Inventory tracking + rebalancing alerts** — track per-venue inventory
+2. **Inventory tracking + rebalancing alerts** — track per-venue inventory
    drift, alert (not act) when a transfer is worth it.
-4. **FX/metals execution** — extend execution adapters to Kraken/Bitstamp
+3. **FX/metals execution** — extend execution adapters to Kraken/Bitstamp
    fiat pairs and PAXG once crypto-leg behavior is proven.
-5. **Notifications** — push/webhook on trade, partial, or breaker trip.
+4. **Notifications** — push/webhook on trade, partial, or breaker trip.
 
-Done: ~~auto-unwind of partial fills~~ — partials are market-ed out
-immediately (`trader._unwind`), and a failed unwind trips the breaker.
+Done:
+
+- ~~Auto-unwind of partial fills~~ — partials are market-ed out immediately
+  (`trader._unwind`), and a failed unwind trips the breaker.
+- ~~Venue precision filters~~ — lot/tick/minimum rules from Binance
+  `exchangeInfo` and Kraken `AssetPairs`, cached per process
+  (`execution.pair_rules`); orders are quantized before firing (buy price
+  floors, sell price ceils — never worse than quoted) and skipped when the
+  rules are unavailable or the size falls below a venue minimum.

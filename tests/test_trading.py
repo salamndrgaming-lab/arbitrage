@@ -5,6 +5,7 @@ place real orders. Signing helpers are tested for determinism/shape only.
 """
 
 import asyncio
+import base64
 import time
 
 import httpx
@@ -21,7 +22,10 @@ from arb.trading.execution import (
     ExecutionVenue,
     KrakenExecution,
     OrderResult,
+    PairRules,
     build_executors,
+    ceil_to_step,
+    floor_to_step,
 )
 from arb.trading.risk import RiskManager
 from arb.trading.trader import NotArmedError, Trader, arm_check
@@ -167,20 +171,100 @@ def test_kraken_signature_shape():
     assert "nonce" in signed["data"]
 
 
+# -- precision rules -------------------------------------------------------
+
+
+def test_step_rounding_helpers():
+    assert floor_to_step(0.123456, 0.001) == pytest.approx(0.123)
+    assert ceil_to_step(100.001, 0.01) == pytest.approx(100.01)
+    # Exact multiples stay put in both directions.
+    assert floor_to_step(0.123, 0.001) == pytest.approx(0.123)
+    assert ceil_to_step(0.123, 0.001) == pytest.approx(0.123)
+    # Zero step means unconstrained.
+    assert floor_to_step(0.123456, 0) == 0.123456
+    assert ceil_to_step(0.123456, 0) == 0.123456
+
+
+def mock_client(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def test_binance_pair_rules_parse_and_cache():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"symbols": [{"filters": [
+            {"filterType": "LOT_SIZE", "stepSize": "0.00001",
+             "minQty": "0.0001"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            {"filterType": "NOTIONAL", "minNotional": "5"},
+        ]}]})
+
+    async def go():
+        ex = BinanceExecution("k", "s")
+        async with mock_client(handler) as client:
+            rules = await ex.pair_rules(client, "BTC", "USDT")
+            await ex.pair_rules(client, "BTC", "USDT")  # cached
+        return rules
+
+    rules = run(go())
+    assert rules == PairRules(qty_step=0.00001, price_tick=0.01,
+                              min_qty=0.0001, min_notional=5.0)
+    assert len(calls) == 1
+
+
+def test_kraken_pair_rules_parse():
+    def handler(request):
+        assert request.url.params["pair"] == "XBTUSD"
+        return httpx.Response(200, json={"error": [], "result": {"XXBTZUSD": {
+            "lot_decimals": 8, "pair_decimals": 1,
+            "ordermin": "0.0001", "costmin": "0.5",
+        }}})
+
+    async def go():
+        ex = KrakenExecution("k", base64.b64encode(b"s").decode())
+        async with mock_client(handler) as client:
+            return await ex.pair_rules(client, "BTC", "USD")
+
+    rules = run(go())
+    assert rules.qty_step == pytest.approx(1e-8)
+    assert rules.price_tick == pytest.approx(0.1)
+    assert rules.min_qty == pytest.approx(0.0001)
+    assert rules.min_notional == pytest.approx(0.5)
+
+
+def test_pair_rules_unknown_symbol_raises():
+    def handler(request):
+        return httpx.Response(200, json={"symbols": []})
+
+    async def go():
+        ex = BinanceExecution("k", "s")
+        async with mock_client(handler) as client:
+            await ex.pair_rules(client, "NOPE", "USDT")
+
+    with pytest.raises(ExecutionError, match="unknown symbol"):
+        run(go())
+
+
 # -- trader flow -----------------------------------------------------------
 
 
 class StubExecutor(ExecutionVenue):
     def __init__(self, name, balances=None, fail=False, fill_ratio=1.0,
-                 market_fail=False, market_fill_ratio=1.0):
+                 market_fail=False, market_fill_ratio=1.0, rules=None):
         self.name = name
         self._balances = balances or {"USD": 1e6, "USDT": 1e6, "BTC": 10, "ETH": 100}
         self.fail = fail
         self.fill_ratio = fill_ratio
         self.market_fail = market_fail
         self.market_fill_ratio = market_fill_ratio
+        self.rules = rules or PairRules()  # unconstrained by default
         self.orders = []
         self.market_orders = []
+
+    async def pair_rules(self, client, base, quote):
+        return self.rules
 
     async def balances(self, client):
         return self._balances
@@ -321,6 +405,96 @@ def test_unwind_can_be_disabled(tmp_path, monkeypatch):
     assert [t["status"] for t in store.recent_trades()] == ["partial"]
     assert executors["kraken"].market_orders == []
     assert executors["binance"].market_orders == []
+    store.close()
+
+
+def test_trader_quantizes_to_venue_rules(tmp_path, monkeypatch):
+    # Coarser lot step wins (both legs must carry equal qty); buy price
+    # floors to its tick, sell price ceils to its tick.
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch,
+        buy_venue=StubExecutor("kraken", rules=PairRules(
+            qty_step=0.0001, price_tick=0.1, min_qty=0.0001, min_notional=0.5)),
+        sell_venue=StubExecutor("binance", rules=PairRules(
+            qty_step=0.00001, price_tick=0.01, min_qty=0.00001, min_notional=5)),
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    (side, base, quote, qty, price), = executors["kraken"].orders
+    assert qty == pytest.approx(floor_to_step(qty, 0.0001))
+    assert price == pytest.approx(floor_to_step(price, 0.1))
+    (_, _, _, sqty, sprice), = executors["binance"].orders
+    assert sqty == pytest.approx(qty)  # both legs share the quantized qty
+    assert sprice == pytest.approx(ceil_to_step(sprice, 0.01))
+    trades = store.recent_trades()
+    assert trades[0]["status"] == "filled"
+    assert trades[0]["qty"] == pytest.approx(qty)
+    store.close()
+
+
+def test_trader_skips_below_venue_minimum(tmp_path, monkeypatch):
+    # Venue minimum above what the per-trade cap can buy -> no order fires.
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch,
+        buy_venue=StubExecutor("kraken", rules=PairRules(min_qty=1.0)),
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    assert executors["kraken"].orders == []
+    assert executors["binance"].orders == []
+    assert store.recent_trades() == []
+    store.close()
+
+
+def test_trader_skips_when_rules_unavailable(tmp_path, monkeypatch):
+    # Fail closed: if precision rules can't be fetched, don't guess.
+    class NoRules(StubExecutor):
+        async def pair_rules(self, client, base, quote):
+            raise ExecutionError("exchangeInfo down")
+
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch, buy_venue=NoRules("kraken"),
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    assert executors["binance"].orders == []
+    assert store.recent_trades() == []
+    store.close()
+
+
+def test_unwind_residual_below_minimum_is_dust(tmp_path, monkeypatch):
+    # Sell leg misses 40%; the buy-venue minimum is larger than the
+    # residual -> recorded as dust, no market order, breaker NOT tripped.
+    # Cap of $2000 buys qty 0.02, clearing the 0.01 entry minimum; the
+    # 40% residual (0.008) does not.
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch,
+        buy_venue=StubExecutor("kraken", rules=PairRules(min_qty=0.01)),
+        sell_venue=StubExecutor("binance", fill_ratio=0.6),
+        max_trade_notional_usd=2000, max_daily_notional_usd=10_000,
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    trades = store.recent_trades()
+    assert [t["status"] for t in trades] == ["unwind_dust", "partial"]
+    assert executors["kraken"].market_orders == []
+    assert not trader.risk.tripped
     store.close()
 
 

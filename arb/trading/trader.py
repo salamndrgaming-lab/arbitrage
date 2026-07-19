@@ -27,7 +27,13 @@ from ..config import Config
 from ..models import Opportunity
 from ..poller import Poller
 from ..store import Store
-from .execution import ExecutionError, ExecutionVenue, build_executors
+from .execution import (
+    ExecutionError,
+    ExecutionVenue,
+    build_executors,
+    ceil_to_step,
+    floor_to_step,
+)
 from .risk import RiskManager
 
 log = logging.getLogger("arb.trader")
@@ -78,6 +84,39 @@ class Trader:
         qty = notional / opp.buy_price
         return qty, notional
 
+    async def _apply_precision(
+        self, client: httpx.AsyncClient, opp: Opportunity, qty: float
+    ) -> tuple[float, float, float, str | None]:
+        """Quantize (qty, buy_price, sell_price) to both venues' rules.
+
+        Both legs must carry the same base quantity, so qty is floored to
+        the coarser of the two lot steps. Prices round in the conservative
+        direction (buy down, sell up) — never worse than the quoted edge.
+        Returns a rejection reason if the quantized order violates either
+        venue's minimums, or if the rules cannot be fetched (fail closed:
+        no order is better than a guessed order).
+        """
+        try:
+            buy_rules, sell_rules = await asyncio.gather(
+                self.executors[opp.buy_exchange].pair_rules(
+                    client, opp.base, opp.buy_quote),
+                self.executors[opp.sell_exchange].pair_rules(
+                    client, opp.base, opp.sell_quote),
+            )
+        except Exception as exc:
+            return qty, opp.buy_price, opp.sell_price, (
+                f"precision rules unavailable: {exc}")
+        qty = floor_to_step(qty, max(buy_rules.qty_step, sell_rules.qty_step))
+        buy_price = floor_to_step(opp.buy_price, buy_rules.price_tick)
+        sell_price = ceil_to_step(opp.sell_price, sell_rules.price_tick)
+        if qty <= 0 or qty < max(buy_rules.min_qty, sell_rules.min_qty):
+            return qty, buy_price, sell_price, (
+                f"qty {qty:.8f} below venue minimum")
+        if (qty * buy_price < buy_rules.min_notional
+                or qty * sell_price < sell_rules.min_notional):
+            return qty, buy_price, sell_price, "below venue minimum notional"
+        return qty, buy_price, sell_price, None
+
     async def _check_balances(
         self, client: httpx.AsyncClient, opp: Opportunity, qty: float, notional: float
     ) -> str | None:
@@ -102,7 +141,8 @@ class Trader:
         return None
 
     async def _execute(self, client: httpx.AsyncClient, opp: Opportunity,
-                       qty: float, notional: float) -> None:
+                       qty: float, notional: float,
+                       buy_price: float, sell_price: float) -> None:
         self.trades_attempted += 1
         self.risk.note_trade(opp.base)
         buy_exec = self.executors[opp.buy_exchange]
@@ -110,9 +150,9 @@ class Trader:
 
         results = await asyncio.gather(
             buy_exec.place_ioc_limit(client, opp.base, opp.buy_quote, "buy",
-                                     qty, opp.buy_price),
+                                     qty, buy_price),
             sell_exec.place_ioc_limit(client, opp.base, opp.sell_quote, "sell",
-                                      qty, opp.sell_price),
+                                      qty, sell_price),
             return_exceptions=True,
         )
         buy_res, sell_res = results
@@ -166,6 +206,28 @@ class Trader:
         else:
             venue, side, unwind_qty = opp.sell_exchange, "buy", -delta
             quote, ref_price = opp.sell_quote, opp.sell_price
+        # Quantize to the venue's lot rules. A residual below the venue
+        # minimum literally cannot be traded there — record it as dust
+        # (bounded by one lot) instead of tripping the breaker. If rules
+        # can't be fetched, still fire the unwind unrounded: flattening
+        # matters more than precision, and a rejection trips the breaker.
+        try:
+            rules = await self.executors[venue].pair_rules(
+                client, opp.base, quote)
+        except Exception as exc:
+            log.warning("unwind: precision rules unavailable on %s (%s);"
+                        " firing unrounded", venue, exc)
+            rules = None
+        if rules is not None:
+            unwind_qty = floor_to_step(unwind_qty, rules.qty_step)
+            if (unwind_qty <= 0 or unwind_qty < rules.min_qty
+                    or unwind_qty * ref_price < rules.min_notional):
+                detail = (f"residual {abs(delta):.8f} {opp.base} on {venue}"
+                          f" below venue minimum; not tradable")
+                log.warning("unwind dust: %s", detail)
+                self.store.record_trade(opp, abs(delta), abs(delta) * ref_price,
+                                        "unwind_dust", detail)
+                return
         try:
             res = await self.executors[venue].place_market(
                 client, opp.base, quote, side, unwind_qty)
@@ -202,11 +264,17 @@ class Trader:
                 log.debug("skip %s %s->%s: %s", opp.base, opp.buy_exchange,
                           opp.sell_exchange, decision.reason)
                 continue
+            qty, buy_price, sell_price, reason = await self._apply_precision(
+                client, opp, qty)
+            if reason:
+                log.info("skip %s: %s", opp.base, reason)
+                continue
+            notional = qty * buy_price  # shrinks with lot rounding, never grows
             reason = await self._check_balances(client, opp, qty, notional)
             if reason:
                 log.info("skip %s: %s", opp.base, reason)
                 continue
-            await self._execute(client, opp, qty, notional)
+            await self._execute(client, opp, qty, notional, buy_price, sell_price)
             break  # at most one trade per cycle, by design
 
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
