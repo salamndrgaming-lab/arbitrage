@@ -16,6 +16,13 @@ from arb.models import Opportunity, Quote
 from arb.poller import Poller
 from arb.store import Store
 from arb.trading import ARMING_ENV, ARMING_PHRASE
+from arb.trading.books import (
+    BinanceBookFeed,
+    KrakenBookFeed,
+    LiveBooks,
+    TopOfBook,
+    build_feeds,
+)
 from arb.trading.execution import (
     BinanceExecution,
     ExecutionError,
@@ -247,6 +254,124 @@ def test_pair_rules_unknown_symbol_raises():
         run(go())
 
 
+# -- live book feeds -------------------------------------------------------
+
+
+def test_binance_book_feed_parses_bookticker():
+    books = LiveBooks()
+    feed = BinanceBookFeed(books, ["BTC"])
+    assert "btcusdt@bookTicker" in feed.url()
+    feed.handle({"stream": "btcusdt@bookTicker", "data": {
+        "s": "BTCUSDT", "b": "100000.1", "B": "0.5", "a": "100000.9", "A": "0.7",
+    }})
+    top = books.top("binance", "BTC", "USDT")
+    assert (top.bid, top.bid_qty, top.ask, top.ask_qty) == (
+        100000.1, 0.5, 100000.9, 0.7)
+    # Unknown symbols are ignored.
+    feed.handle({"data": {"s": "DOGEUSDT", "b": "1", "B": "1", "a": "1", "A": "1"}})
+    assert books.top("binance", "DOGE", "USDT") is None
+
+
+def test_kraken_book_feed_parses_ticker():
+    books = LiveBooks()
+    feed = KrakenBookFeed(books, ["BTC", "ETH"])
+    sub = feed.subscribe_payload()
+    assert "BTC/USD" in sub and "ETH/USD" in sub
+    feed.handle({"channel": "ticker", "type": "update", "data": [{
+        "symbol": "BTC/USD", "bid": 99990.0, "bid_qty": 1.2,
+        "ask": 100010.0, "ask_qty": 0.8,
+    }]})
+    top = books.top("kraken", "BTC", "USD")
+    assert (top.bid, top.ask, top.ask_qty) == (99990.0, 100010.0, 0.8)
+    # Non-ticker channels are ignored.
+    feed.handle({"channel": "heartbeat"})
+
+
+def test_build_feeds_covers_supported_venues():
+    books = LiveBooks()
+    feeds = build_feeds(books, ["kraken", "binance", "bitstamp"], ["BTC"])
+    assert sorted(f.venue for f in feeds) == ["binance", "kraken"]
+
+
+def test_live_books_freshness():
+    books = LiveBooks()
+    now = time.time()
+    books.update("binance", "BTC", "USDT",
+                 TopOfBook(1, 1, 2, 1, ts=now))
+    books.update("kraken", "BTC", "USD",
+                 TopOfBook(1, 1, 2, 1, ts=now - 60))
+    assert books.fresh_count(max_age=3, now=now) == 1
+
+
+def fresh_books(buy_ask=100010.0, buy_ask_qty=5.0,
+                sell_bid=100900.0, sell_bid_qty=5.0, age=0.0):
+    """Books for the make_trader scenario: buy kraken/USD, sell binance/USD."""
+    books = LiveBooks()
+    ts = time.time() - age
+    books.update("kraken", "BTC", "USD",
+                 TopOfBook(buy_ask - 5, 1.0, buy_ask, buy_ask_qty, ts))
+    books.update("binance", "BTC", "USD",
+                 TopOfBook(sell_bid, sell_bid_qty, sell_bid + 5, 1.0, ts))
+    return books
+
+
+def test_trader_caps_size_at_displayed_depth(tmp_path, monkeypatch):
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch,
+        books=fresh_books(buy_ask_qty=0.0004, sell_bid_qty=5.0),
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    (side, base, quote, qty, price), = executors["kraken"].orders
+    assert qty == pytest.approx(0.0004)  # displayed size, not the $100 cap
+    assert price == pytest.approx(100010.0)  # live ask, not the REST quote
+    (_, _, _, sqty, sprice), = executors["binance"].orders
+    assert sqty == pytest.approx(0.0004)
+    assert sprice == pytest.approx(100900.0)  # live bid
+    assert store.recent_trades()[0]["status"] == "filled"
+    store.close()
+
+
+def test_trader_skips_when_live_spread_collapses(tmp_path, monkeypatch):
+    # REST quotes still show 80 bps, but the live book has converged.
+    # (BTC only: an asset with no book would fall back to REST and trade.)
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch, books=fresh_books(sell_bid=100020.0),
+        assets=["BTC"],
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    assert executors["kraken"].orders == []
+    assert executors["binance"].orders == []
+    assert store.recent_trades() == []
+    store.close()
+
+
+def test_trader_falls_back_to_rest_when_books_stale(tmp_path, monkeypatch):
+    # Books exist but are a minute old -> ignore them, trade on REST quotes.
+    trader, store, executors = make_trader(
+        tmp_path, monkeypatch, books=fresh_books(buy_ask=90000.0, age=60),
+    )
+
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await trader.run_cycle(client)
+
+    run(go())
+    (_, _, _, qty, price), = executors["kraken"].orders
+    assert price == pytest.approx(100010.0)  # REST ask, not the stale 90000
+    assert store.recent_trades()[0]["status"] == "filled"
+    store.close()
+
+
 # -- trader flow -----------------------------------------------------------
 
 
@@ -285,7 +410,7 @@ class StubExecutor(ExecutionVenue):
 
 
 def make_trader(tmp_path, monkeypatch, buy_venue=None, sell_venue=None,
-                spread_bps=80, **cfg_overrides):
+                spread_bps=80, books=None, **cfg_overrides):
     monkeypatch.setenv(ARMING_ENV, ARMING_PHRASE)
     cfg = trading_cfg(tmp_path, min_execute_bps=30, cooldown_seconds=0,
                       **cfg_overrides)
@@ -299,7 +424,7 @@ def make_trader(tmp_path, monkeypatch, buy_venue=None, sell_venue=None,
         "kraken": buy_venue or StubExecutor("kraken"),
         "binance": sell_venue or StubExecutor("binance"),
     }
-    trader = Trader(cfg, store, executors=executors, poller=poller)
+    trader = Trader(cfg, store, executors=executors, poller=poller, books=books)
     return trader, store, executors
 
 

@@ -45,6 +45,7 @@ in this codebase; every price comes from a venue API at request/poll time.
 | Risk gate | `arb/trading/risk.py` | Every-trade limit checks, kill switch, circuit breaker |
 | Execution | `arb/trading/execution.py` | Authenticated Binance/Kraken IOC limit orders + balances |
 | Trader | `arb/trading/trader.py` | Autonomous loop: data → gate → balances → dual-leg fire → audit |
+| Live books | `arb/trading/books.py` | WS top-of-book feeds (Binance/Kraken): pre-fire re-verify + size caps |
 | Entrypoints | `arb/cli.py`, `arb/trade.py` | Scanner CLI; trading `check` / `status` / `run` |
 
 ## Trading design
@@ -83,6 +84,7 @@ behavior to something a human can watch.
 | Auto-unwind of partials: market-out the overfilled leg immediately | on (`unwind_partials`) | `trader._unwind` |
 | Failed unwind → breaker trips instantly (naked exposure) | always | `trader._unwind` |
 | Venue lot/tick/minimum rules enforced pre-trade (fail closed) | always | `trader._apply_precision` |
+| Live-book re-verify + displayed-size cap before firing | on (`use_ws_books`) | `trader._live_adjust` |
 | Full audit trail (every attempt, including failures) | always | `store.trades` |
 | Trading code excluded from serverless deploys | always | `webapp.py` never imports `arb.trading` |
 | Credentials only via environment, never config/logs | always | `execution.from_env` |
@@ -140,13 +142,14 @@ itself is additionally gated by Vercel Deployment Protection.
 
 ## Roadmap (in order)
 
-1. **WebSocket order books** — depth-aware sizing and sub-second quotes to
-   replace REST top-of-book polling.
-2. **Inventory tracking + rebalancing alerts** — track per-venue inventory
+1. **Inventory tracking + rebalancing alerts** — track per-venue inventory
    drift, alert (not act) when a transfer is worth it.
-3. **FX/metals execution** — extend execution adapters to Kraken/Bitstamp
+2. **FX/metals execution** — extend execution adapters to Kraken/Bitstamp
    fiat pairs and PAXG once crypto-leg behavior is proven.
-4. **Notifications** — push/webhook on trade, partial, or breaker trip.
+3. **Notifications** — push/webhook on trade, partial, or breaker trip.
+4. **Full L2 depth books** — today's WS feeds carry top-of-book with
+   displayed size; walking deeper levels would allow sizing beyond the
+   best quote.
 
 Done:
 
@@ -157,3 +160,10 @@ Done:
   (`execution.pair_rules`); orders are quantized before firing (buy price
   floors, sell price ceils — never worse than quoted) and skipped when the
   rules are unavailable or the size falls below a venue minimum.
+- ~~WebSocket order books (top-of-book)~~ — `arb/trading/books.py` keeps
+  sub-second best bid/ask with displayed size via Binance `bookTicker` and
+  Kraken v2 `ticker` streams. Right before firing, the trader re-verifies
+  the net edge against live prices and caps order size at the smaller
+  displayed quantity of the two legs. Advisory by design: with no fresh
+  book the trader falls back to REST quotes, still guarded by the
+  stale-quote check.

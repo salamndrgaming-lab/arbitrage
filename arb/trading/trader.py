@@ -27,6 +27,7 @@ from ..config import Config
 from ..models import Opportunity
 from ..poller import Poller
 from ..store import Store
+from .books import LiveBooks, build_feeds
 from .execution import (
     ExecutionError,
     ExecutionVenue,
@@ -65,6 +66,7 @@ class Trader:
         store: Store,
         executors: dict[str, ExecutionVenue] | None = None,
         poller: Poller | None = None,
+        books: LiveBooks | None = None,
     ):
         arm_check(cfg)
         self.cfg = cfg
@@ -74,6 +76,9 @@ class Trader:
         )
         self.poller = poller or Poller(cfg, store)
         self.risk = RiskManager(cfg.trading, store)
+        self.books = books if books is not None else (
+            LiveBooks() if cfg.trading.use_ws_books else None
+        )
         self.trades_attempted = 0
 
     # ------------------------------------------------------------------
@@ -84,8 +89,42 @@ class Trader:
         qty = notional / opp.buy_price
         return qty, notional
 
+    def _live_adjust(
+        self, opp: Opportunity, qty: float
+    ) -> tuple[float, float, float, str | None]:
+        """Re-verify the spread against live WS top-of-book and cap size
+        at the displayed quantity.
+
+        Returns (qty, buy_price, sell_price, rejection_reason). With no
+        fresh book on either leg this is a no-op falling back to the REST
+        quotes (still guarded by the stale-quote check). With fresh books:
+        the live net edge (live gross minus the opportunity's original
+        cost load) must still clear ``min_execute_bps``, and qty is capped
+        at the smaller displayed size of the two legs.
+        """
+        if self.books is None:
+            return qty, opp.buy_price, opp.sell_price, None
+        buy_top = self.books.top(opp.buy_exchange, opp.base, opp.buy_quote)
+        sell_top = self.books.top(opp.sell_exchange, opp.base, opp.sell_quote)
+        now = time.time()
+        max_age = self.cfg.trading.max_quote_age_seconds
+        if (buy_top is None or sell_top is None
+                or now - buy_top.ts > max_age or now - sell_top.ts > max_age):
+            return qty, opp.buy_price, opp.sell_price, None
+        gross_live = (sell_top.bid - buy_top.ask) / buy_top.ask * 10_000
+        cost_bps = opp.gross_bps - opp.net_bps  # fees + haircut, unchanged
+        net_live = gross_live - cost_bps
+        if net_live < self.cfg.trading.min_execute_bps:
+            return qty, buy_top.ask, sell_top.bid, (
+                f"live net {net_live:.1f} bps below execute threshold")
+        qty = min(qty, buy_top.ask_qty, sell_top.bid_qty)
+        if qty <= 0:
+            return qty, buy_top.ask, sell_top.bid, "no displayed size at top of book"
+        return qty, buy_top.ask, sell_top.bid, None
+
     async def _apply_precision(
-        self, client: httpx.AsyncClient, opp: Opportunity, qty: float
+        self, client: httpx.AsyncClient, opp: Opportunity, qty: float,
+        buy_price: float, sell_price: float,
     ) -> tuple[float, float, float, str | None]:
         """Quantize (qty, buy_price, sell_price) to both venues' rules.
 
@@ -104,11 +143,11 @@ class Trader:
                     client, opp.base, opp.sell_quote),
             )
         except Exception as exc:
-            return qty, opp.buy_price, opp.sell_price, (
+            return qty, buy_price, sell_price, (
                 f"precision rules unavailable: {exc}")
         qty = floor_to_step(qty, max(buy_rules.qty_step, sell_rules.qty_step))
-        buy_price = floor_to_step(opp.buy_price, buy_rules.price_tick)
-        sell_price = ceil_to_step(opp.sell_price, sell_rules.price_tick)
+        buy_price = floor_to_step(buy_price, buy_rules.price_tick)
+        sell_price = ceil_to_step(sell_price, sell_rules.price_tick)
         if qty <= 0 or qty < max(buy_rules.min_qty, sell_rules.min_qty):
             return qty, buy_price, sell_price, (
                 f"qty {qty:.8f} below venue minimum")
@@ -264,8 +303,12 @@ class Trader:
                 log.debug("skip %s %s->%s: %s", opp.base, opp.buy_exchange,
                           opp.sell_exchange, decision.reason)
                 continue
+            qty, buy_price, sell_price, reason = self._live_adjust(opp, qty)
+            if reason:
+                log.info("skip %s: %s", opp.base, reason)
+                continue
             qty, buy_price, sell_price, reason = await self._apply_precision(
-                client, opp, qty)
+                client, opp, qty, buy_price, sell_price)
             if reason:
                 log.info("skip %s: %s", opp.base, reason)
                 continue
@@ -287,26 +330,42 @@ class Trader:
             self.cfg.trading.max_daily_notional_usd,
             self.cfg.trading.max_daily_loss_usd,
         )
-        async with httpx.AsyncClient(timeout=10) as client:
-            while not stop.is_set():
-                started = time.time()
-                try:
-                    await self.run_cycle(client)
-                except Exception:
-                    log.exception("trader cycle failed")
-                    self.risk.record_result(False)
-                if self.risk.tripped:
-                    log.error("circuit breaker tripped — trading disarmed until restart")
-                    break
-                if self.risk.kill_switch_active():
-                    log.warning("kill switch active — exiting trader loop")
-                    break
-                elapsed = time.time() - started
-                delay = max(0.5, self.cfg.poll_interval - elapsed)
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass
+        feed_tasks: list[asyncio.Task] = []
+        if self.books is not None:
+            try:
+                import websockets  # noqa: F401  (feeds need it at runtime)
+
+                feeds = build_feeds(self.books, self.cfg.trading.venues,
+                                    self.cfg.trading.assets)
+                feed_tasks = [asyncio.create_task(f.run(stop)) for f in feeds]
+                log.info("live book feeds: %s", [f.venue for f in feeds])
+            except ImportError:
+                log.warning("websockets not installed — REST quotes only")
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                while not stop.is_set():
+                    started = time.time()
+                    try:
+                        await self.run_cycle(client)
+                    except Exception:
+                        log.exception("trader cycle failed")
+                        self.risk.record_result(False)
+                    if self.risk.tripped:
+                        log.error("circuit breaker tripped — trading disarmed"
+                                  " until restart")
+                        break
+                    if self.risk.kill_switch_active():
+                        log.warning("kill switch active — exiting trader loop")
+                        break
+                    elapsed = time.time() - started
+                    delay = max(0.5, self.cfg.poll_interval - elapsed)
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            for task in feed_tasks:
+                task.cancel()
 
     def status(self) -> dict:
         stats = self.store.trade_stats_since(time.time() - 24 * 3600)
@@ -327,4 +386,8 @@ class Trader:
             },
             "venues": list(self.executors),
             "assets": self.cfg.trading.assets,
+            "ws_books_fresh": (
+                self.books.fresh_count(self.cfg.trading.max_quote_age_seconds)
+                if self.books is not None else 0
+            ),
         }

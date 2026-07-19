@@ -71,6 +71,10 @@ class TradingConfig:
     # one-sided exposure to seconds. Disable only if you prefer to resolve
     # partials by hand — an unwind failure trips the circuit breaker.
     unwind_partials: bool = True
+    # Live WS top-of-book feeds: re-verify the spread and cap size at the
+    # displayed quantity right before firing. Advisory — with no fresh
+    # book the trader falls back to REST quotes (stale-check still applies).
+    use_ws_books: bool = True
 
 
 @dataclass
@@ -186,6 +190,7 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
                 raw_trading.get("max_consecutive_failures", t.max_consecutive_failures)),
             kill_switch_file=raw_trading.get("kill_switch_file", t.kill_switch_file),
             unwind_partials=bool(raw_trading.get("unwind_partials", t.unwind_partials)),
+            use_ws_books=bool(raw_trading.get("use_ws_books", t.use_ws_books)),
         )
 
     if os.environ.get("ARB_DB"):

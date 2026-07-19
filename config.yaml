@@ -59,3 +59,4 @@ trading:
   max_consecutive_failures: 3   # circuit breaker: then disarm until restart
   kill_switch_file: TRADING_KILL_SWITCH
   unwind_partials: true         # market-out the overfilled leg of a partial
+  use_ws_books: true            # live WS top-of-book: re-verify + size caps

@@ -150,7 +150,9 @@ touch TRADING_KILL_SWITCH    # halt trading immediately, no deploy needed
 Every trade passes a risk gate first: per-trade/daily notional caps, daily
 loss limit, trade-count cap, per-asset cooldown, stale-quote rejection,
 venue/asset allowlists, venue lot/tick/minimum rules (fetched from exchange
-metadata and enforced before any order fires — no rules, no trade),
+metadata and enforced before any order fires — no rules, no trade), a live
+WebSocket top-of-book re-check that re-verifies the spread and caps order
+size at the displayed depth just before firing,
 balance pre-checks on both legs, and a circuit
 breaker that disarms after consecutive failures. A partial fill is
 **auto-unwound**: the overfilled leg is immediately market-ordered back on
